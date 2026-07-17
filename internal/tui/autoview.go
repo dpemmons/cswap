@@ -14,6 +14,7 @@ package tui
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -383,32 +384,67 @@ func (a *autoScreen) footerBindings(m *Model) []footerBinding {
 // -- rendering ---------------------------------------------------------------
 
 func (a *autoScreen) view(m *Model) string {
-	var t richText
 	inner := m.width
 	if inner == 0 {
 		inner = 80
 	}
-	t.addText(accountsPanelText(m.snapshot, inner, false, m.thresholdPct, m.nowSeconds()))
-	t.addPlain("\n\n")
-	// badge
+	// Pinned chrome: the active account card, the mode badge + summary line, and
+	// the ranked candidates. Only the event log below flexes (09§4: the RichLog
+	// is the screen's one scrollable region; everything above it stays put).
+	var chrome richText
+	chrome.addText(accountsPanelText(m.snapshot, inner, false, m.thresholdPct, m.nowSeconds()))
+	chrome.addPlain("\n\n")
 	if a.dryRun || a.engine == nil {
-		t.add(" DRY-RUN ", segStyle{Fg: colSevWarn, Bold: true})
+		chrome.add(" DRY-RUN ", segStyle{Fg: colSevWarn, Bold: true})
 	} else {
-		t.add(" LIVE ", segStyle{Fg: colBackground, Bold: true})
+		chrome.add(" LIVE ", segStyle{Fg: colBackground, Bold: true})
 	}
-	t.addPlain("  ")
-	t.addText(a.summaryText())
-	t.addPlain("\n")
-	t.addText(a.candidates)
-	t.addPlain("\n\n")
+	chrome.addPlain("  ")
+	chrome.addText(a.summaryText())
+	chrome.addPlain("\n")
+	chrome.addText(a.candidates)
+	chromeLines := strings.Split(chrome.render(), "\n")
+
+	// Event log (flex): the full history is kept in a.log; only the newest lines
+	// that fit are rendered, tail-following like Textual's auto-scrolled RichLog.
+	logLines := make([]string, 0, len(a.log))
 	for _, ln := range a.log {
+		var lt richText
 		if ln.stamp != "" {
-			t.addFg(ln.stamp+"  ", colMuted)
+			lt.addFg(ln.stamp+"  ", colMuted)
 		}
-		t.addFg(ln.body, ln.color)
-		t.addPlain("\n")
+		lt.addFg(ln.body, ln.color)
+		logLines = append(logLines, lt.render())
 	}
-	return t.render()
+
+	avail := m.contentHeight()
+	if avail < 0 {
+		// Terminal size unknown → render everything (pre-size fallback).
+		out := append([]string{}, chromeLines...)
+		out = append(out, "")
+		return strings.Join(append(out, logLines...), "\n")
+	}
+	if avail == 0 {
+		return ""
+	}
+	// Reserve one blank line between the chrome and the log.
+	logBudget := avail - len(chromeLines) - 1
+	if logBudget < 0 {
+		// Tiny terminal: even the chrome does not fully fit. Keep its top (the
+		// status block's first line) and drop the log entirely — status truncates
+		// last, the log never gets a negative budget.
+		if len(chromeLines) > avail {
+			chromeLines = chromeLines[:avail]
+		}
+		return strings.Join(chromeLines, "\n")
+	}
+	tail := logLines
+	if len(tail) > logBudget {
+		tail = tail[len(tail)-logBudget:]
+	}
+	out := append([]string{}, chromeLines...)
+	out = append(out, "")
+	return strings.Join(append(out, tail...), "\n")
 }
 
 // summaryText builds the #auto-summary line exactly (09§4.5).

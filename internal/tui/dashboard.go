@@ -219,24 +219,78 @@ func (d *dashboardScreen) openSwitch(m *Model) tea.Cmd {
 }
 
 func (d *dashboardScreen) view(m *Model) string {
-	var b strings.Builder
 	inner := m.width
 	if inner == 0 {
 		inner = 80
 	}
-	b.WriteString(accountsPanelText(m.snapshot, inner, true, m.thresholdPct, m.nowSeconds()).render())
-	b.WriteString("\n\n")
+	now := m.nowSeconds()
+
 	crumb := make([]string, 0, len(d.menuStack))
 	for _, f := range d.menuStack {
 		crumb = append(crumb, f.title)
 	}
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Render(strings.Join(crumb, " › ")))
-	b.WriteString("\n")
-	for i, e := range d.currentEntries() {
-		b.WriteString(menuRow(e, i == d.index))
-		b.WriteString("\n")
+	crumbLine := mutedLine(strings.Join(crumb, " › "))
+
+	entries := d.currentEntries()
+	rows := make([]string, len(entries))
+	for i, e := range entries {
+		rows[i] = menuRow(e, i == d.index)
 	}
-	return b.String()
+
+	panelLines := strings.Split(accountsPanelText(m.snapshot, inner, true, m.thresholdPct, now).render(), "\n")
+
+	avail := m.contentHeight()
+	if avail < 0 {
+		// Terminal size unknown → render everything (pre-size fallback).
+		out := append([]string{}, panelLines...)
+		out = append(out, "", crumbLine)
+		return strings.Join(append(out, rows...), "\n")
+	}
+	if avail == 0 {
+		return ""
+	}
+
+	menuFull := 1 + len(rows) // breadcrumb + menu rows
+	gap := 1
+	if len(panelLines)+gap+menuFull <= avail {
+		out := append([]string{}, panelLines...)
+		out = append(out, "", crumbLine)
+		return strings.Join(append(out, rows...), "\n")
+	}
+
+	// Overflow: the interactive menu (with its cursor) is the priority region and
+	// stays visible; the accounts monitor (a panel) truncates with an overflow
+	// indicator to whatever height is left. The menu takes what it needs but is
+	// capped so the panel keeps roughly half the space (its own overflow beyond
+	// that windows around the cursor).
+	menuBudget := menuFull
+	panelKeep := clampInt((avail-gap)/2, 1, len(panelLines))
+	if menuBudget > avail-gap-panelKeep {
+		menuBudget = avail - gap - panelKeep
+	}
+	if menuBudget < 1 {
+		menuBudget = 1
+	}
+	panelBudget := avail - gap - menuBudget
+	if panelBudget < 0 {
+		panelBudget = 0
+	}
+
+	var out []string
+	if panelBudget > 0 {
+		out = append(out, accountsMonitorCapped(m.snapshot, inner, m.thresholdPct, now, panelBudget)...)
+		out = append(out, "")
+	}
+	rowsBudget := menuBudget - 1
+	if rowsBudget < 1 {
+		rowsBudget = 1
+	}
+	out = append(out, crumbLine)
+	out = append(out, windowRows(rows, rowsBudget, d.index)...)
+	if len(out) > avail {
+		out = out[:avail]
+	}
+	return strings.Join(out, "\n")
 }
 
 // menuRow renders one menu row with the accent left-border cursor affordance
@@ -388,21 +442,28 @@ func (a *accountListScreen) cursorUp(m *Model) {
 	}
 }
 
-// renderList renders the title and each account card, cursor-marked (09§3.4).
+// renderList renders the pinned title and a height-aware window of account
+// cards (09§3.4/§3.7). The title stays put; the list flexes — windowed around
+// the cursor so the selected card is always visible (Switch, Watch-while-
+// selecting), or panned by the monitor scroll offset (Watch monitor mode). Cards
+// are multi-line, so the window is computed at line granularity.
 func (a *accountListScreen) renderList(m *Model) string {
-	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Render(a.title))
-	b.WriteString("\n\n")
+	titleLine := mutedLine(a.title)
 	if m.snapshot == nil || len(m.snapshot.Accounts) == 0 {
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(colMuted)).Render("No managed accounts."))
-		return b.String()
+		return titleLine + "\n\n" + mutedLine("No managed accounts.")
 	}
 	inner := m.width
 	if inner == 0 {
 		inner = 80
 	}
 	now := m.nowSeconds()
+
+	var bodyLines []string
+	cursorStart, cursorEnd := -1, -1
 	for i, acc := range m.snapshot.Accounts {
+		if i > 0 {
+			bodyLines = append(bodyLines, "") // blank line between cards
+		}
 		selected := a.index != nil && *a.index == i
 		marker := "  "
 		if selected {
@@ -412,10 +473,30 @@ func (a *accountListScreen) renderList(m *Model) string {
 		if _, flashing := a.flashing[acc.Number]; flashing {
 			card = lipgloss.NewStyle().Background(lipgloss.Color(colPanel)).Render(card)
 		}
-		b.WriteString(marker + indentContinuation(card))
-		b.WriteString("\n\n")
+		blockLines := strings.Split(marker+indentContinuation(card), "\n")
+		if selected {
+			cursorStart = len(bodyLines)
+			cursorEnd = len(bodyLines) + len(blockLines)
+		}
+		bodyLines = append(bodyLines, blockLines...)
 	}
-	return b.String()
+
+	titleBlock := []string{titleLine, ""}
+	avail := m.contentHeight()
+	if avail < 0 {
+		// Terminal size unknown → render everything (pre-size fallback).
+		return strings.Join(append(titleBlock, bodyLines...), "\n")
+	}
+	if avail < len(titleBlock) {
+		return strings.Join(titleBlock[:avail], "\n") // tiny: title truncates last
+	}
+	region := avail - len(titleBlock)
+	win := windowLines(bodyLines, region, cursorStart, cursorEnd, a.scroll, a.index != nil)
+	out := append(append([]string{}, titleBlock...), win...)
+	if len(out) > avail {
+		out = out[:avail]
+	}
+	return strings.Join(out, "\n")
 }
 
 // -- Switch screen (09§3.6) --------------------------------------------------

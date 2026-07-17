@@ -297,18 +297,9 @@ func miniAccountText(acc reporting.AccountSnapshot, now float64) richText {
 	return t
 }
 
-// accountsPanelText renders the always-visible monitor (09§5.6): the active
-// account full-size, others as one-line minis when showMinis. snap nil →
-// "loading…"; no accounts → the two-line empty hint. Blocks breathe (blank
-// line) around any multi-line (expanded) block.
-func accountsPanelText(snap *reporting.AccountsSnapshot, width int, showMinis bool, threshold *float64, now float64) richText {
-	var t richText
-	if snap == nil {
-		return *t.addFg("loading…", colMuted)
-	}
-	if len(snap.Accounts) == 0 {
-		return *t.addFg("No managed accounts yet.\nUse the menu below: Add account — from your current Claude Code login, or from a setup-token / API key.", colMuted)
-	}
+// accountBlocks builds the per-account monitor blocks (09§5.6): the active
+// account full-size, others as one-line minis when showMinis (else skipped).
+func accountBlocks(snap *reporting.AccountsSnapshot, width int, showMinis bool, threshold *float64, now float64) []richText {
 	inner := width - 2
 	var blocks []richText
 	for _, acc := range snap.Accounts {
@@ -318,9 +309,13 @@ func accountsPanelText(snap *reporting.AccountsSnapshot, width int, showMinis bo
 			blocks = append(blocks, miniAccountText(acc, now))
 		}
 	}
-	if len(blocks) == 0 {
-		return *t.addFg("no active managed login", colMuted)
-	}
+	return blocks
+}
+
+// joinBlocks stacks monitor blocks with the breathe rule (09§5.6): a blank line
+// around any multi-line (expanded) block, a single newline between two minis.
+func joinBlocks(blocks []richText) richText {
+	var t richText
 	previousMultiline := false
 	for i, block := range blocks {
 		multiline := strings.Contains(block.plain(), "\n")
@@ -335,6 +330,76 @@ func accountsPanelText(snap *reporting.AccountsSnapshot, width int, showMinis bo
 		previousMultiline = multiline
 	}
 	return t
+}
+
+// accountsPanelText renders the always-visible monitor (09§5.6): the active
+// account full-size, others as one-line minis when showMinis. snap nil →
+// "loading…"; no accounts → the two-line empty hint. Blocks breathe (blank
+// line) around any multi-line (expanded) block.
+func accountsPanelText(snap *reporting.AccountsSnapshot, width int, showMinis bool, threshold *float64, now float64) richText {
+	var t richText
+	if snap == nil {
+		return *t.addFg("loading…", colMuted)
+	}
+	if len(snap.Accounts) == 0 {
+		return *t.addFg("No managed accounts yet.\nUse the menu below: Add account — from your current Claude Code login, or from a setup-token / API key.", colMuted)
+	}
+	blocks := accountBlocks(snap, width, showMinis, threshold, now)
+	if len(blocks) == 0 {
+		return *t.addFg("no active managed login", colMuted)
+	}
+	return joinBlocks(blocks)
+}
+
+// accountsMonitorCapped renders the dashboard monitor (showMinis) into at most
+// budget lines, dropping trailing accounts and appending a muted "· N more
+// accounts" indicator for the ones it elided (the sweep fix for the dashboard:
+// a panel truncates rather than pushing the interactive menu off the screen).
+// budget<=0 yields no lines. Short/empty monitors (loading, the empty hint, or
+// a monitor that already fits) render whole.
+func accountsMonitorCapped(snap *reporting.AccountsSnapshot, width int, threshold *float64, now float64, budget int) []string {
+	if budget <= 0 {
+		return nil
+	}
+	full := accountsPanelText(snap, width, true, threshold, now).render()
+	fullLines := strings.Split(full, "\n")
+	if len(fullLines) <= budget {
+		return fullLines
+	}
+	// Rebuild account-by-account, stopping before the joined block would exceed
+	// budget-1 (reserving one row for the indicator), but always showing at
+	// least the first (active) block.
+	blocks := accountBlocks(snap, width, true, threshold, now)
+	var acc richText
+	prevMultiline := false
+	shown := 0
+	for i, block := range blocks {
+		var trial richText
+		trial.addText(acc)
+		multiline := strings.Contains(block.plain(), "\n")
+		if i > 0 {
+			if multiline || prevMultiline {
+				trial.addPlain("\n\n")
+			} else {
+				trial.addPlain("\n")
+			}
+		}
+		trial.addText(block)
+		if shown > 0 && strings.Count(trial.plain(), "\n")+1 > budget-1 {
+			break
+		}
+		acc = trial
+		prevMultiline = multiline
+		shown++
+	}
+	lines := strings.Split(acc.render(), "\n")
+	if hidden := len(blocks) - shown; hidden > 0 {
+		lines = append(lines, mutedLine(fmt.Sprintf("· %d more account%s", hidden, plural(hidden))))
+	}
+	if len(lines) > budget {
+		lines = lines[:budget]
+	}
+	return lines
 }
 
 // formatMoney formats a value with comma thousands separators and 2 decimals

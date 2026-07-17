@@ -250,6 +250,31 @@ func (m *Model) View() string {
 	return body + sep + bottomBlock
 }
 
+// contentHeight is the number of rows a primary screen's body may occupy before
+// View's bottom chrome (toasts + footer) would push its top off the alt-screen.
+// It equals the terminal height minus the exact height of that bottom block, so
+// a screen that caps its flexing region to this value can never overflow. A
+// return of -1 means the terminal size is not yet known — screens fall back to
+// rendering everything (their pre-size behavior). See viewport.go for the per-
+// screen flex/pin discipline that consumes this budget.
+func (m *Model) contentHeight() int {
+	if m.height <= 0 {
+		return -1
+	}
+	reserved := 0
+	for _, t := range m.toasts {
+		reserved += lipgloss.Height(renderToast(t))
+	}
+	if _, ok := m.top().(footerScreen); ok {
+		reserved++ // the footer bar is always one row
+	}
+	h := m.height - reserved
+	if h < 0 {
+		h = 0
+	}
+	return h
+}
+
 // -- screen stack ------------------------------------------------------------
 
 // top returns the active (top-of-stack) screen.
