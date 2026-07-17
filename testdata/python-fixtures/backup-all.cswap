@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "exportedAt": "2026-07-17T08:46:10Z",
+  "exportedFrom": "linux",
+  "swapVersion": "0.22.0b1",
+  "encrypted": false,
+  "activeAccountNumber": 1,
+  "accounts": [
+    {
+      "number": 1,
+      "email": "alice@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:45:45Z",
+      "credentials": {
+        "claudeAiOauth": {
+          "accessToken": "sk-ant-oat01-AAAAfixture0000000000000000000000000000000000000000",
+          "scopes": [
+            "user:inference"
+          ]
+        }
+      },
+      "config": {
+        "oauthAccount": {
+          "emailAddress": "alice@example.com",
+          "accountUuid": "",
+          "organizationUuid": null,
+          "organizationName": null
+        }
+      }
+    },
+    {
+      "number": 2,
+      "email": "bob@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "credentials": {
+        "claudeAiOauth": {
+          "accessToken": "sk-ant-oat01-BBBBfixture0000000000000000000000000000000000000000",
+          "scopes": [
+            "user:inference"
+          ]
+        }
+      },
+      "config": {
+        "oauthAccount": {
+          "emailAddress": "bob@example.com",
+          "accountUuid": "",
+          "organizationUuid": null,
+          "organizationName": null
+        }
+      },
+      "alias": "dev"
+    },
+    {
+      "number": 3,
+      "email": "key@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "credentials": "sk-ant-api03-CCCCfixture000000000000000000000000000000000000000",
+      "config": {
+        "oauthAccount": {
+          "emailAddress": "key@example.com",
+          "accountUuid": "",
+          "organizationUuid": null,
+          "organizationName": null
+        }
+      },
+      "kind": "api_key"
+    },
+    {
+      "number": 5,
+      "email": "carol@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "credentials": {
+        "claudeAiOauth": {
+          "accessToken": "sk-ant-oat01-DDDDfixture0000000000000000000000000000000000000000",
+          "scopes": [
+            "user:inference"
+          ]
+        }
+      },
+      "config": {
+        "oauthAccount": {
+          "emailAddress": "carol@example.com",
+          "accountUuid": "",
+          "organizationUuid": null,
+          "organizationName": null
+        }
+      }
+    }
+  ]
+}

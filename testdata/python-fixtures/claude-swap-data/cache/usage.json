@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 2,
+  "accounts": {
+    "1": {
+      "email": "alice@example.com",
+      "organizationUuid": "",
+      "authDeadStrikes": 0,
+      "consecutiveFailures": 1,
+      "lastError": "http-401",
+      "backoffUntil": 1784278000.047882,
+      "lastAttemptAt": 1784277970.047882
+    },
+    "2": {
+      "email": "bob@example.com",
+      "organizationUuid": "",
+      "authDeadStrikes": 0,
+      "consecutiveFailures": 1,
+      "lastError": "http-401",
+      "backoffUntil": 1784278000.047882,
+      "lastAttemptAt": 1784277970.047882
+    },
+    "3": {
+      "email": "key@example.com",
+      "organizationUuid": "",
+      "authDeadStrikes": 0,
+      "consecutiveFailures": 0,
+      "lastError": null,
+      "backoffUntil": null
+    },
+    "5": {
+      "email": "carol@example.com",
+      "organizationUuid": "",
+      "authDeadStrikes": 0,
+      "consecutiveFailures": 1,
+      "lastError": "http-401",
+      "backoffUntil": 1784278000.047882,
+      "lastAttemptAt": 1784277970.047882
+    }
+  }
+}

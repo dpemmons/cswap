@@ -1,0 +1,43 @@
+{
+  "activeAccountNumber": 1,
+  "lastUpdated": "2026-07-17T08:46:09Z",
+  "sequence": [
+    1,
+    2,
+    3,
+    5
+  ],
+  "accounts": {
+    "1": {
+      "email": "alice@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:45:45Z"
+    },
+    "2": {
+      "email": "bob@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "alias": "dev"
+    },
+    "3": {
+      "email": "key@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "kind": "api_key"
+    },
+    "5": {
+      "email": "carol@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "disabled": true
+    }
+  }
+}

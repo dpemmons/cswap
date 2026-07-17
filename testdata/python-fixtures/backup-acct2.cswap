@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "exportedAt": "2026-07-17T08:46:10Z",
+  "exportedFrom": "linux",
+  "swapVersion": "0.22.0b1",
+  "encrypted": false,
+  "activeAccountNumber": null,
+  "accounts": [
+    {
+      "number": 2,
+      "email": "bob@example.com",
+      "uuid": "",
+      "organizationUuid": "",
+      "organizationName": "",
+      "added": "2026-07-17T08:46:08Z",
+      "credentials": {
+        "claudeAiOauth": {
+          "accessToken": "sk-ant-oat01-BBBBfixture0000000000000000000000000000000000000000",
+          "scopes": [
+            "user:inference"
+          ]
+        }
+      },
+      "config": {
+        "oauthAccount": {
+          "emailAddress": "bob@example.com",
+          "accountUuid": "",
+          "organizationUuid": null,
+          "organizationName": null
+        }
+      },
+      "alias": "dev"
+    }
+  ]
+}

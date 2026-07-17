@@ -1,0 +1,13 @@
+2026-07-17 01:45:45,258 - INFO - Added account 1 from token: alice@example.com
+2026-07-17 01:46:08,416 - INFO - Added account 2 from token: bob@example.com
+2026-07-17 01:46:08,520 - INFO - Added account 3 from API key: key@example.com
+2026-07-17 01:46:08,631 - INFO - Added account 5 from token: carol@example.com
+2026-07-17 01:46:08,848 - INFO - Disabled account 5: carol@example.com
+2026-07-17 01:46:09,267 - INFO - Activated account 2 (no prior live account)
+2026-07-17 01:46:09,370 - INFO - Backed up account 2 (config only; credentials unchanged)
+2026-07-17 01:46:09,371 - INFO - Wrote target credentials
+2026-07-17 01:46:09,371 - INFO - Updated config file
+2026-07-17 01:46:09,371 - INFO - Switched from account 2 to 1
+2026-07-17 01:46:09,539 - WARNING - Usage fetch failed for account 1: http-401
+2026-07-17 01:46:09,775 - WARNING - Usage fetch failed for account 2: http-401
+2026-07-17 01:46:10,047 - WARNING - Usage fetch failed for account 5: http-401
