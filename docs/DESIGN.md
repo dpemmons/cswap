@@ -941,3 +941,53 @@ fields. It is a deliberate Go-side extension with no Python counterpart: the
 Python original shows per-model pct rows but its `usageStatus` and list markers
 ignore them, so this adds signal without breaking any documented shape. The
 Python-fidelity contract in `docs/port-spec/` is unchanged.
+
+## A16. `cswap env` — pin a shell to an account (Go-side additive extension)
+
+`cswap env [NUM|EMAIL|ALIAS] [--no-share] [--share-history] [--shell sh|fish|pwsh]
+[--unset] [--debug]` gives the CURRENT shell a per-account Claude Code identity —
+`eval "$(cswap env 2)"` — by preparing the same persistent session profile
+`cswap run` uses and then PRINTING shell-evalable env lines instead of exec'ing
+claude. It is a deliberate Go-side extension with no Python counterpart, added to
+the `--help` command list (one line) and epilog as a documented deviation from
+the verbatim Python help text; `docs/port-spec/` is untouched.
+
+**Surface & dispatch.** Pre-dispatched on the first argv token exactly like
+`run`/`map`/`alias` (front-controller pre-dispatch list + its own flag parser +
+`_guard_root` + the `ClaudeSwitchError`→exit 1 / Ctrl-C→130 wrapping). `--shell`
+defaults to `sh`; an invalid value is a usage error (exit 2) listing the choices.
+`--unset` skips account resolution and bootstrap entirely and prints only the
+`CLAUDE_CONFIG_DIR` unset line for the chosen shell; `--unset` with an account
+argument is a usage error (exit 2).
+
+**Account resolution** is identical to `run`: explicit `NUM|EMAIL|ALIAS`, else the
+cwd's directory mapping, else error (exit 1). Unlike `run` there is NO
+default-login fallback — an unset `CLAUDE_CONFIG_DIR` IS the default, so the
+error points the user at passing an account, mapping the directory, or
+`cswap env --unset`.
+
+**Profile preparation** reuses the existing session machinery verbatim:
+`session.Manager.SetupEnv` calls the SAME exported `SetupSession`
+(bootstrap/validate/mirror/share, honoring `--no-share`/`--share-history`) that
+`Run` calls — no duplicated bootstrap logic. The one intentional divergence from
+`Run` is the same-account case: `Run` has an exec fast path when the requested
+account is already the active default login, but a shell pinned to a profile is
+still pinned even when the default currently matches, so `env` does NOT
+short-circuit — it prints an informational stderr note and still emits the
+export of the session profile.
+
+**Output discipline (critical).** stdout carries ONLY the eval-able lines; every
+notice/warning goes to stderr. The `SessionManager`'s message sink is wired to
+stderr, so its bootstrap/scrub/"Prepared" notices never pollute the eval stream.
+Emitted lines: for each `AUTH_OVERRIDE_ENV_VARS` currently set, a shell-specific
+unset line (`unset VAR` / `set -e VAR` / `Remove-Item Env:VAR …`) plus ONE
+stderr warning naming them (the `run` scrub wording adapted for env); then the
+export line (`export CLAUDE_CONFIG_DIR='<dir>'` with POSIX single-quote escaping
+/ `set -gx CLAUDE_CONFIG_DIR '<dir>'` / `$env:CLAUDE_CONFIG_DIR = '<dir>'`), each
+quoted for its shell so a profile path containing a single quote survives.
+
+**Staleness.** The shell keeps the pinned profile until the user re-evals; after
+switching accounts or a credential change they re-run the `eval` or use
+`cswap run` (which re-prepares on every launch). Claude Code's live-session
+guards keep working because it writes its session files inside the profile
+directory the export points at.

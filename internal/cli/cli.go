@@ -42,6 +42,8 @@ func run(prog string, argv []string, s ioStreams, stdinTTY, stdoutTTY bool) int 
 		switch argv[0] {
 		case "run":
 			return runCommand(prog, argv[1:], s)
+		case "env":
+			return envCommand(prog, argv[1:], s)
 		case "auto":
 			return autoCommand(prog, argv[1:], s)
 		case "config":

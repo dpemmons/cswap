@@ -39,6 +39,7 @@ Commands:
   cswap enable <num|email>         return a disabled account to rotation
   cswap run <num|email> [-- ...]   run as an account, this terminal only
   cswap run                        run the current dir's mapped account
+  cswap env <num|email>            print an eval-able CLAUDE_CONFIG_DIR export for this shell
   cswap map <num|email> [path]     map a directory to an account
   cswap map                        list directory mappings
   cswap unmap [path]               remove a directory mapping
@@ -68,6 +69,7 @@ const mainEpilog = `Flags combine with subcommands:
   cswap add --slot 3                      # add to a specific slot
   cswap add-token sk-ant-oat01-... --email me@example.com
   cswap run 2 -- --resume                 # forward args after '--' to claude
+  eval "$(cswap env 2)"                   # pin THIS shell to account 2 (no claude launch)
   cswap auto --once                       # single auto-switch tick (cron-friendly)
   cswap config set autoswitch.threshold 80
 

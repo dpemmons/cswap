@@ -51,6 +51,33 @@ cswap run 2 -- --resume         # args after '--' go to claude
 cswap map 2 ~/work/client-app   # bare `cswap run` in that dir → account 2
 ```
 
+Pin the current shell to an account instead of launching claude (`cswap env`,
+a Go-side extension with no Python counterpart):
+
+```bash
+eval "$(cswap env 2)"           # this shell's `claude` now runs as account 2
+eval "$(cswap env)"             # resolve the account from this dir's mapping
+eval "$(cswap env --unset)"     # drop the pin (back to the default login)
+```
+
+`cswap env` prepares the same persistent session profile `cswap run` does
+(bootstrap / validate / mirror / `--no-share` / `--share-history` all apply) and
+then prints an eval-able `CLAUDE_CONFIG_DIR` export instead of exec'ing claude —
+stdout carries only the eval lines, every notice goes to stderr. Other shells:
+
+```fish
+cswap env 2 --shell fish | source          # fish
+```
+```powershell
+cswap env 2 --shell pwsh | Invoke-Expression  # PowerShell
+```
+
+Staleness caveat: the shell keeps whatever profile you eval'd until you re-eval.
+After switching accounts or a credential change, re-run the `eval` (or just use
+`cswap run`, which re-prepares on every launch). Claude Code's live-session
+guards still work regardless, because it writes its session files inside the
+profile directory the export points at.
+
 Everything else:
 
 ```bash
