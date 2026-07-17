@@ -5,7 +5,7 @@ A full-fidelity Go port of `claude-swap`, grounded in the behavioral specs in
 
 - Module: `git.dpemmons.com/dpemmons/cswap` · Go 1.25 · single binary `cswap`
   (also installed as `claude-swap`).
-- No cgo. macOS Keychain via `/usr/bin/security` subprocess exactly as Python.
+- No cgo. macOS Keychain via the `security` subprocess exactly as Python.
 - TUI: bubbletea v1.3 + lipgloss v1.1 + bubbles v1.0. HTTP: stdlib `net/http`.
   Extra deps limited to `golang.org/x/sys` (flock/`LockFileEx`, Windows PID
   probe, console VT) and `golang.org/x/text/unicode/norm` (NFC for
@@ -749,11 +749,8 @@ regression.
 
 # Amendments (final design decisions — these OVERRIDE anything above)
 
-This design was selected over a competing "faithful-structure" proposal by an
-adversarial judge; the judgment is in the project history. The following
-amendments graft the losing proposal's genuinely better ideas and fix issues
-both proposals shared. Where an amendment contradicts the body above, the
-amendment wins.
+These amendments state final design decisions. Where an amendment contradicts
+the body above, the amendment wins.
 
 ## A1. Usage round-trip fidelity (REJECTS Deviation #8)
 
