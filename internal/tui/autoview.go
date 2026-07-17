@@ -361,6 +361,25 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	return out
 }
 
+// footerBindings are the Auto screen's footer-visible bindings (09§4.1): l
+// ("Go live / dry-run"), t ("Threshold") and back always show; the
+// threshold_step arrows and adjust_done Enter are gated by check_action and
+// appear only while adjusting the threshold.
+func (a *autoScreen) footerBindings(m *Model) []footerBinding {
+	bindings := []footerBinding{
+		{"l", "Go live / dry-run"},
+		{"t", "Threshold"},
+	}
+	if a.adjusting {
+		bindings = append(bindings,
+			footerBinding{"←", "-1%"},
+			footerBinding{"→", "+1%"},
+			footerBinding{"enter", "Done"},
+		)
+	}
+	return append(bindings, footerBinding{"esc", "Back"})
+}
+
 // -- rendering ---------------------------------------------------------------
 
 func (a *autoScreen) view(m *Model) string {

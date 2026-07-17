@@ -220,20 +220,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the top screen plus any active toasts.
+// View renders the top screen, its keybinding footer, and any active toasts.
+// The footer bar sits on the last row (with toasts stacked just above it) when
+// the terminal height is known; a primary screen supplies its footer bindings
+// via footerScreen, while modals — which cover the footer and carry their own
+// inline hints — do not.
 func (m *Model) View() string {
 	if m.quitting {
 		return ""
 	}
 	body := m.top().view(m)
-	if len(m.toasts) == 0 {
+	var bottom []string
+	for _, t := range m.toasts {
+		bottom = append(bottom, renderToast(t))
+	}
+	if fs, ok := m.top().(footerScreen); ok {
+		bottom = append(bottom, m.renderFooter(fs.footerBindings(m)))
+	}
+	if len(bottom) == 0 {
 		return body
 	}
-	var lines []string
-	for _, t := range m.toasts {
-		lines = append(lines, renderToast(t))
+	bottomBlock := strings.Join(bottom, "\n")
+	sep := "\n"
+	if m.height > 0 {
+		if gap := m.height - lipgloss.Height(body) - lipgloss.Height(bottomBlock); gap > 0 {
+			sep = strings.Repeat("\n", gap+1)
+		}
 	}
-	return body + "\n" + strings.Join(lines, "\n")
+	return body + sep + bottomBlock
 }
 
 // -- screen stack ------------------------------------------------------------

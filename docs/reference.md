@@ -1530,6 +1530,13 @@ an auto-switch screen). Requires an interactive terminal on both stdin and
 stdout; a bare `cswap` invoked from a pipe or non-interactive context prints the
 `no command given` usage error instead of opening the dashboard.
 
+A keybinding bar at the bottom of each screen lists the keys available there:
+on the dashboard, `s` switch accounts, `w` watch, `q` quit; on the switch
+screen, `enter` switch, `b` best pick, `esc` back; on the watch screen, `s`
+switch (`enter` confirm while a target is selected), `esc` back; on the
+auto-switch screen, `l` go live / dry-run, `t` threshold (with `←`/`→` to adjust
+and `enter` to finish while adjusting), `esc` back.
+
 ### Files
 
 Reads and writes the same files the underlying commands do while the dashboard

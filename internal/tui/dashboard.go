@@ -200,6 +200,16 @@ func (d *dashboardScreen) dispatch(m *Model, actionID string) tea.Cmd {
 	return nil
 }
 
+// footerBindings are the dashboard's footer-visible bindings (09§3.1): s/w/q
+// show; back/g/f/j/k are hidden.
+func (d *dashboardScreen) footerBindings(m *Model) []footerBinding {
+	return []footerBinding{
+		{"s", "Switch accounts"},
+		{"w", "Watch"},
+		{"q", "Quit"},
+	}
+}
+
 // openSwitch pushes the Switch screen unless it is already the top (09§3.3).
 func (d *dashboardScreen) openSwitch(m *Model) tea.Cmd {
 	if _, ok := m.top().(*switchScreen); ok {
@@ -456,6 +466,16 @@ func (s *switchScreen) selectHighlighted(m *Model) tea.Cmd {
 	return tea.Batch(cmd, pop)
 }
 
+// footerBindings are the Switch screen's footer-visible bindings (09§3.6): the
+// priority Enter shows as "Switch", b as "Best pick", and back; j/k are hidden.
+func (s *switchScreen) footerBindings(m *Model) []footerBinding {
+	return []footerBinding{
+		{"enter", "Switch"},
+		{"b", "Best pick"},
+		{"esc", "Back"},
+	}
+}
+
 func (s *switchScreen) view(m *Model) string { return s.renderList(m) }
 
 // -- Watch screen (09§3.7) ---------------------------------------------------
@@ -564,6 +584,17 @@ func (w *watchScreen) navUp(m *Model) {
 	} else if w.scroll > 0 {
 		w.scroll--
 	}
+}
+
+// footerBindings are the Watch screen's footer-visible bindings (09§3.7): s
+// ("Switch") always shows and back shows; the priority Enter ("Confirm") is
+// gated by check_action and appears only while selecting; f/nav are hidden.
+func (w *watchScreen) footerBindings(m *Model) []footerBinding {
+	bindings := []footerBinding{{"s", "Switch"}}
+	if w.selecting {
+		bindings = append(bindings, footerBinding{"enter", "Confirm"})
+	}
+	return append(bindings, footerBinding{"esc", "Back"})
 }
 
 func (w *watchScreen) view(m *Model) string { return w.renderList(m) }
