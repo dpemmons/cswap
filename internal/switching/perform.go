@@ -11,6 +11,8 @@ package switching
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
@@ -111,10 +113,7 @@ func performSwitch(s *store.Store, targetAccount string, emitOutput, forceActiva
 		}
 		cfgText, cfgExists, cfgErr := readConfigText()
 		if cfgErr != nil {
-			if os.IsPermission(cfgErr) {
-				return cerr.Config("Permission denied reading Claude config")
-			}
-			return cerr.Config("Claude config file not found")
+			return configReadError(cfgErr)
 		}
 		if !cfgExists {
 			return cerr.Config("Claude config file not found")
@@ -476,6 +475,23 @@ func printSwitchFollowup(s *store.Store) {
 		printOut(printer.Dimmed("Restart Claude Code to apply immediately — otherwise the session can take up to ~30 seconds to pick up the new account."))
 	} else {
 		printOut(printer.Dimmed("New account is active on your next message — no restart needed."))
+	}
+}
+
+// configReadError maps a non-nil ~/.claude.json read error to the domain error.
+// Only a genuine absence is "not found" (fs.ErrNotExist); permission is called
+// out; and every other cause — a directory at the path, an I/O error — surfaces
+// with its real message rather than being misreported as "not found". This
+// mirrors Python, where FileNotFoundError/PermissionError are caught explicitly
+// and any other OSError propagates raw with its own message.
+func configReadError(err error) error {
+	switch {
+	case os.IsPermission(err):
+		return cerr.Config("Permission denied reading Claude config")
+	case errors.Is(err, fs.ErrNotExist):
+		return cerr.Config("Claude config file not found")
+	default:
+		return cerr.Config("Failed to read Claude config: %v", err).Wrap(err)
 	}
 }
 

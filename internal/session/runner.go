@@ -10,6 +10,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os/exec"
 	"time"
@@ -17,6 +18,12 @@ import (
 	"git.dpemmons.com/dpemmons/cswap/internal/cclock"
 	"git.dpemmons.com/dpemmons/cswap/internal/clock"
 )
+
+// probeWaitDelay bounds how long Probe blocks after the deadline fires (or the
+// child exits) waiting on captured pipes that a grandchild may still hold open.
+// Without it cmd.Run reads the stdout/stderr pipes until EOF and can outlive the
+// timeout indefinitely when an orphaned subprocess keeps a descriptor.
+const probeWaitDelay = 2 * time.Second
 
 // Runner abstracts process discovery and execution.
 type Runner interface {
@@ -47,12 +54,19 @@ func (osRunner) Probe(argv, env []string, timeout time.Duration) (string, int, e
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = env
+	cmd.WaitDelay = probeWaitDelay // don't let a leaked pipe outlive the deadline
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
 		return "", 0, ctx.Err() // TimeoutExpired parity → validation fails
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The child exited but a grandchild held a captured pipe past the grace
+		// window; the probe never completed, so treat it as a timeout
+		// (TimeoutExpired parity → validation fails) rather than an OSError.
+		return "", 0, context.DeadlineExceeded
 	}
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

@@ -12,11 +12,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/logging"
 	"git.dpemmons.com/dpemmons/cswap/internal/printer"
 )
+
+// Output is where the user-visible persist-failure warning lands (04§1.25).
+// It defaults to os.Stdout, matching printer.Warning's destination byte-for-byte
+// so non-TUI behaviour is unchanged. The TUI redirects it to a writer it owns
+// while it holds the alt-screen, so the warning does not corrupt the display.
+var Output io.Writer = os.Stdout
 
 // Log is the package logger seam, mirroring Python's module-level
 // logging.getLogger("claude-swap"). When nil, WARNING/DEBUG lines are dropped.
@@ -176,8 +184,9 @@ func logUsageFailure(logCtx string, err error, kind string, retryAfterS *float64
 }
 
 // persistCredentials calls the persist callback, warning loudly on failure via
-// both the internal log (with email) and a user-visible stdout warning
-// (04§1.25). A nil callback is a no-op.
+// both the internal log (with email) and a user-visible warning written to the
+// package-level Output seam (os.Stdout by default, 04§1.25). A nil callback is a
+// no-op.
 func persistCredentials(persist PersistFn, num, email, creds string) {
 	if persist == nil {
 		return
@@ -189,10 +198,10 @@ func persistCredentials(persist PersistFn, num, email, creds string) {
 				"with invalid_grant, re-run `cswap --add-account` after logging in.",
 			num, email, err,
 		)
-		printer.Warning(fmt.Sprintf(
+		fmt.Fprintln(Output, printer.Yellowed(fmt.Sprintf(
 			"Warning: failed to save refreshed token for account %s (%s). "+
 				"If the next refresh fails, re-run `cswap --add-account` after logging in.",
 			num, email,
-		))
+		)))
 	}
 }

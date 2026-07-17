@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"git.dpemmons.com/dpemmons/cswap/internal/jsonout"
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
 	"git.dpemmons.com/dpemmons/cswap/internal/usage"
 )
@@ -117,9 +118,13 @@ func (f *fakeSwitcher) SwitchTo(num string, jsonOut bool) (map[string]any, error
 	if f.switchTo != nil {
 		return f.switchTo(f, num)
 	}
-	from := map[string]any{"number": atoi(deref(f.current)), "email": f.emails[deref(f.current)]}
+	// Build refs exactly like the production store's payload (jsonout.AccountRef,
+	// whose "number" is a *int), so tests exercise the real switch-event shape.
+	fromN := atoi(deref(f.current))
+	from := jsonout.AccountRef(&fromN, f.emails[deref(f.current)])
 	f.current = strp(num)
-	to := map[string]any{"number": atoi(num), "email": f.emails[num]}
+	toN := atoi(num)
+	to := jsonout.AccountRef(&toN, f.emails[num])
 	return map[string]any{
 		"schemaVersion": 1,
 		"switched":      true,

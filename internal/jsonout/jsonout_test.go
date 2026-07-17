@@ -161,3 +161,48 @@ func TestUsageToJSONProjection(t *testing.T) {
 		t.Errorf("scoped name = %v", scoped[0])
 	}
 }
+
+// TestRound1BankersMatchesPython pins round1 to Python's round(x, 1), which is
+// banker's rounding (round-half-to-even) on the exact binary value of the float
+// — not math.Round's half-away-from-zero. Each expected value is the verified
+// output of python3 -c "print(round(<x>, 1))" (Python 3):
+//
+//	round(90.25, 1) == 90.2   (90.25 exactly representable; tie -> even)
+//	round(90.35, 1) == 90.3   (stored just below the midpoint)
+//	round(90.15, 1) == 90.2   (stored just above the midpoint)
+//	round(0.15,  1) == 0.1    (0.15 stored below 0.15 -> rounds down)
+//	round(0.25,  1) == 0.2    (exactly representable; tie -> even)
+//	round(0.35,  1) == 0.3    (exactly representable; tie -> even)
+//	round(0.45,  1) == 0.5    (stored just above; rounds up)
+//	round(1.25,  1) == 1.2    (exactly representable; tie -> even)
+//	round(8.45,  1) == 8.4    (stored just below the midpoint)
+//	round(2.5,   1) == 2.5    (already one digit)
+//	round(-0.15, 1) == -0.1   (negative mirror of 0.15)
+//	round(-90.25,1) == -90.2  (negative tie -> even)
+//
+// math.Round(x*10)/10 gets 90.25, 0.15, 1.25, 8.45 and the negatives wrong, so
+// this test fails against the old implementation.
+func TestRound1BankersMatchesPython(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want float64
+	}{
+		{90.25, 90.2},
+		{90.35, 90.3},
+		{90.15, 90.2},
+		{0.15, 0.1},
+		{0.25, 0.2},
+		{0.35, 0.3},
+		{0.45, 0.5},
+		{1.25, 1.2},
+		{8.45, 8.4},
+		{2.5, 2.5},
+		{-0.15, -0.1},
+		{-90.25, -90.2},
+	}
+	for _, c := range cases {
+		if got := round1(c.in); got != c.want {
+			t.Errorf("round1(%v) = %v, want %v (Python round(x,1))", c.in, got, c.want)
+		}
+	}
+}

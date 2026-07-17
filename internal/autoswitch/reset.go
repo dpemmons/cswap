@@ -10,6 +10,7 @@
 package autoswitch
 
 import (
+	"math"
 	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
@@ -116,7 +117,15 @@ func (e *Engine) earliestRecovery(usage map[string]any) *float64 {
 // datetime.fromtimestamp(ts, utc).isoformat().replace("+00:00","Z"): RFC3339
 // seconds (or microseconds when non-zero) with a Z suffix.
 func formatRecoveryISO(epoch float64) string {
-	t := time.Unix(0, int64(epoch*1e9)).UTC()
+	// Python's datetime.fromtimestamp rounds the sub-second remainder to the
+	// nearest microsecond (round(frac * 1e6)); truncating epoch*1e9 to
+	// nanoseconds and then to microseconds under-reports by up to ~1µs. Split
+	// off the integer seconds first so the round happens on the small
+	// fractional part (full precision), then let time.Unix carry a 1000000µs
+	// round-up into the next second.
+	sec := math.Floor(epoch)
+	us := int64(math.Round((epoch - sec) * 1e6))
+	t := time.Unix(int64(sec), us*1000).UTC()
 	if t.Nanosecond() == 0 {
 		return t.Format("2006-01-02T15:04:05") + "Z"
 	}

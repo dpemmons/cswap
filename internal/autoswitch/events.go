@@ -181,12 +181,23 @@ func (e PollEvent) Human() string {
 	)
 }
 
-// numToStr renders an account-ref number (stored as int) back to its slot
-// string; a string value passes through.
-func numToStr(v any) string {
+// AccountNumberStr renders an account-ref "number" payload back to its slot
+// string for human display. The payload shape varies by producer: dry-run refs
+// carry a plain int (refOf), but a real switch's from/to come from
+// jsonout.AccountRef, whose number is a *int (nil for an unmanaged live
+// account). A nil *int renders "None" to match Python's f"{None}" (an
+// account ref .get('number') of None). This is the shared renderer the TUI
+// toast (tui/app.go) should adopt so it too handles the *int shape rather than
+// printing a pointer address.
+func AccountNumberStr(v any) string {
 	switch n := v.(type) {
 	case int:
 		return strconv.Itoa(n)
+	case *int:
+		if n == nil {
+			return "None"
+		}
+		return strconv.Itoa(*n)
 	case int64:
 		return strconv.FormatInt(n, 10)
 	case float64:
@@ -197,6 +208,9 @@ func numToStr(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 }
+
+// numToStr is the package-internal alias for AccountNumberStr.
+func numToStr(v any) string { return AccountNumberStr(v) }
 
 // SwitchEvent reports a switch (or, in dry-run, the switch that would happen).
 type SwitchEvent struct {
@@ -430,13 +444,30 @@ func (e ConfigWarningEvent) Human() string {
 // concurrency note 9 — Go maps are unordered so the port carries order itself).
 func sortNumeric(nums []string) []string {
 	out := append([]string(nil), nums...)
-	sort.SliceStable(out, func(i, j int) bool {
-		a, aok := strconv.Atoi(out[i])
-		b, bok := strconv.Atoi(out[j])
-		if aok == nil && bok == nil {
-			return a < b
-		}
-		return out[i] < out[j]
-	})
+	sort.SliceStable(out, func(i, j int) bool { return slotKeyLess(out[i], out[j]) })
 	return out
+}
+
+// slotKeyLess is a total order over slot-key strings: numeric keys sort before
+// non-numeric ones, numerics compare by integer value (equal values tie-break
+// lexicographically for stability), and non-numerics compare lexicographically.
+// A total order is required — a mixed set like "15"/"3"/"2abc" produced an
+// intransitive comparator (3<15, 2abc<3, 15<2abc) under the old
+// numeric-or-lexicographic branch, which sort.Slice may resolve nondeterministically.
+func slotKeyLess(a, b string) bool {
+	na, aok := strconv.Atoi(a)
+	nb, bok := strconv.Atoi(b)
+	switch {
+	case aok == nil && bok == nil:
+		if na != nb {
+			return na < nb
+		}
+		return a < b
+	case aok == nil: // a numeric, b not: numerics first
+		return true
+	case bok == nil: // b numeric, a not: numerics first
+		return false
+	default:
+		return a < b
+	}
 }

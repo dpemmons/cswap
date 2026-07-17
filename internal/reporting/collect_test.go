@@ -7,6 +7,8 @@ package reporting
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -158,6 +160,76 @@ func TestCollect_OwnedExpiredSentinelWinsOverFreshEntry(t *testing.T) {
 	// The last-good measurement is preserved under the sentinel.
 	if entries["1"].LastGood == nil {
 		t.Errorf("last-good measurement was dropped under sentinel")
+	}
+}
+
+func TestCollect_UnreadableSessionsDirFailsClosedNoRefresh(t *testing.T) {
+	// activeCCRunning must fail CLOSED, matching Python _active_cc_running's
+	// `except Exception: return True`: when the instance probe cannot complete
+	// (here the ~/.claude/sessions dir is unreadable), assume an owner may be
+	// running Claude Code and never refresh the live credential out from under
+	// it. The active+expired account must therefore surface USAGE_TOKEN_EXPIRED
+	// and attempt zero refreshes — the buggy fail-open path would read the probe
+	// as "no owner" and rotate the credential.
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; cannot simulate an unreadable sessions dir")
+	}
+	clk := testutil.FixedClock(t, fixedNow)
+	now := clock.Seconds(clk)
+	nowMS := clk.Now().UnixMilli()
+
+	refreshCalls := 0
+	usageCalls := 0
+	oc := &oauth.FakeClient{
+		RefreshFn: func(_ context.Context, _ string) oauth.RefreshOutcome {
+			refreshCalls++
+			return oauth.RefreshOutcome{Credentials: oauthCreds("new-access", "new-refresh", nowMS+3600_000)}
+		},
+		UsageFn: func(_ context.Context, _ string) (map[string]any, error) {
+			usageCalls++
+			return map[string]any{"five_hour": map[string]any{"utilization": 5.0}}, nil
+		},
+	}
+	s := newStore(t, clk, oc)
+
+	// Make ~/.claude/sessions exist but be unreadable so the instance probe's
+	// directory enumeration fails (os.Stat still succeeds via the parent's x
+	// bit; os.ReadDir hits permission denied). No live session is seeded, so the
+	// fail-closed probe is the ONLY reason an owner is assumed.
+	sessionsDir := filepath.Join(s.Home, ".claude", "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sessionsDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	// Restore perms before t.TempDir's cleanup so RemoveAll can traverse it.
+	t.Cleanup(func() { _ = os.Chmod(sessionsDir, 0o755) })
+
+	// Expired relative to the injected clock, which is what the owned/static
+	// expiry check reads (s.Clk.Now()).
+	expiredCreds := oauthCreds("old-access", "old-refresh", nowMS-1000)
+	// Backup matches the live creds so the provenance guard passes: were the
+	// probe to fail open, the no-owner refresh path (not read-as-is) would run.
+	if err := s.Creds.WriteBackup("1", "a@example.com", expiredCreds); err != nil {
+		t.Fatal(err)
+	}
+	writeUsageRows(t, s, map[string]any{
+		"1": map[string]any{"email": "a@example.com", "organizationUuid": "", "fetchedAt": now - 400},
+	})
+
+	infos := []AccountInfo{{Number: 1, Email: "a@example.com", IsActive: true, Creds: expiredCreds}}
+	entries := CollectUsageEntries(s, infos, nil)
+
+	if entries["1"].Sentinel != jsonout.UsageTokenExpired {
+		t.Errorf("sentinel = %q want %q (unreadable probe must fail closed to owned+expired)",
+			entries["1"].Sentinel, jsonout.UsageTokenExpired)
+	}
+	if refreshCalls != 0 {
+		t.Errorf("refresh attempted %d time(s), want 0 (fail-closed owner check must block the refresh)", refreshCalls)
+	}
+	if usageCalls != 0 {
+		t.Errorf("usage fetched %d time(s), want 0", usageCalls)
 	}
 }
 

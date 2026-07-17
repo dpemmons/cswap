@@ -136,3 +136,46 @@ func TestClassifyOutgoing(t *testing.T) {
 		})
 	}
 }
+
+// TestClassifyOutgoingOffSequenceDeterministic pins the FINDING 12 fix: when the
+// uuid fallback scan must disambiguate two OFF-sequence slots carrying an
+// identical uuid+org, sortedAccountKeys must present them in a stable order so
+// the classification (and the attributed foreign slot) is deterministic — not
+// dependent on Go's randomized map iteration. Slots "8" and "9" live only in
+// data.Accounts (not in the sequence), so both land in the sorted tail; the scan
+// must always attribute to the lexically-first one ("8").
+func TestClassifyOutgoingOffSequenceDeterministic(t *testing.T) {
+	const curEmail = "a@x.com"
+	live := oauthCreds("live-access", "ref-live")
+
+	buildData := func() *store.SequenceData {
+		recs := map[string]json.RawMessage{
+			// Outgoing slot 1 is the only slot in the sequence.
+			"1": record(map[string]any{"email": curEmail, "organizationUuid": "", "uuid": "uuid-1"}),
+			// Two off-sequence slots with an IDENTICAL uuid+org: only the sorted
+			// tail order decides which one the fallback scan picks.
+			"8": record(map[string]any{"email": "eight@x.com", "organizationUuid": "org-dup", "uuid": "uuid-dup"}),
+			"9": record(map[string]any{"email": "nine@x.com", "organizationUuid": "org-dup", "uuid": "uuid-dup"}),
+		}
+		return seqData(ptrInt(1), []int{1}, recs)
+	}
+
+	for i := 0; i < 50; i++ {
+		s := newTestStore(t, nil)
+		// Slot 1's backup diverges from the live bytes so classification consults
+		// the resolved identity rather than short-circuiting on own-bytes/family.
+		seedBackup(t, s, "1", curEmail, oauthCreds("a", "refA"), "")
+		data := buildData()
+		// Resolved identity: uuid+org match slots 8 and 9; the email matches no
+		// slot, so the email-based lookup returns "" and the uuid fallback scan
+		// (which walks sortedAccountKeys) decides the attribution.
+		prov := &Provenance{
+			Live:     &live,
+			Resolved: &oauth.Identity{UUID: "uuid-dup", Email: "dup@x.com", OrgUUID: "org-dup"},
+		}
+		kind, foreign := classifyOutgoing(s, "1", curEmail, live, prov, data)
+		if kind != "foreign" || foreign != "8" {
+			t.Fatalf("iteration %d: got (%q, %q), want (\"foreign\", \"8\")", i, kind, foreign)
+		}
+	}
+}

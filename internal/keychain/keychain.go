@@ -143,10 +143,16 @@ func (s Security) call(argv []string, stdin string) (execResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.budget())
 	defer cancel()
 	res, err := runner(ctx, argv, stdin)
-	if ctx.Err() == context.DeadlineExceeded {
-		return execResult{}, keychainErrorf("security %s timed out after %s", commandName(argv), s.budget())
-	}
+	// Classify by the command's actual outcome, mirroring Python's
+	// subprocess.run: TimeoutExpired fires only when the process is killed by
+	// the deadline, never when the process completed and produced a result. A
+	// non-nil error means the process could not be run or was killed; only then
+	// can the deadline have discarded output. A result completing at ~the
+	// deadline (nil err) is honored even if ctx has since expired.
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return execResult{}, keychainErrorf("security %s timed out after %s", commandName(argv), s.budget())
+		}
 		return execResult{}, err
 	}
 	return res, nil
@@ -240,9 +246,20 @@ func realExec(ctx context.Context, argv []string, stdin string) (execResult, err
 	err := cmd.Run()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
+			// A process the deadline killed is terminated by signal, so it never
+			// exited cleanly: surface a DeadlineExceeded error rather than its
+			// synthetic rc (-1) so call() classifies it as a timeout. A process
+			// that exited on its own — any rc — is honored, even if the deadline
+			// then fired (matches Python's TimeoutExpired-on-kill-only semantics).
+			if ctx.Err() == context.DeadlineExceeded && !ee.Exited() {
+				return execResult{}, ctx.Err()
+			}
 			return execResult{stdout: out.String(), stderr: errb.String(), rc: ee.ExitCode()}, nil
 		}
-		// Could not start (missing binary, etc.) or context cancelled.
+		// Could not start (missing binary, etc.) or context cancelled before start.
+		if ctx.Err() == context.DeadlineExceeded {
+			return execResult{}, ctx.Err()
+		}
 		return execResult{}, err
 	}
 	return execResult{stdout: out.String(), stderr: errb.String(), rc: 0}, nil

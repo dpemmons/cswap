@@ -65,15 +65,29 @@ func IsPIDAlive(pid int) bool {
 // whose PID is currently alive. Returns an empty slice if the sessions
 // subdirectory isn't a directory. A file that is corrupt JSON, has no
 // integer-valued "pid" field, or fails to read is skipped, never raised.
+// A failure to enumerate the directory itself (e.g. permission denied) is
+// swallowed here — see ListSessionsErr for the error-surfacing variant.
 func ListSessions(claudeDir string) []ClaudeSession {
+	out, _ := ListSessionsErr(claudeDir)
+	return out
+}
+
+// ListSessionsErr is ListSessions but surfaces a directory-enumeration error
+// (e.g. an unreadable sessions dir) instead of swallowing it. Per-file
+// corruption/read failures are still skipped silently, matching Python
+// list_sessions, whose in-loop try/except catches per-file errors while a
+// failure iterating sessions_dir.glob("*.json") propagates to the caller.
+func ListSessionsErr(claudeDir string) ([]ClaudeSession, error) {
 	out := []ClaudeSession{}
 	sessionsDir := filepath.Join(claudeDir, "sessions")
 	info, err := os.Stat(sessionsDir)
 	if err != nil || !info.IsDir() {
-		return out
+		return out, nil
 	}
-	matches, _ := filepath.Glob(filepath.Join(sessionsDir, "*.json"))
-	sort.Strings(matches)
+	matches, err := listDirEntries(sessionsDir, ".json")
+	if err != nil {
+		return out, err
+	}
 	for _, path := range matches {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -104,23 +118,35 @@ func ListSessions(claudeDir string) []ClaudeSession {
 			Status:     getOptionalString(m, "status"),
 		})
 	}
-	return out
+	return out, nil
 }
 
 // ListIDEInstances globs <claudeDir>/ide/*.lock and returns the IDE
 // instances whose PID is currently alive. Returns an empty slice if the ide
 // subdirectory isn't a directory. A lockfile that is corrupt JSON, has a
 // missing/null "pid" field, or an unparsable-integer filename stem is
-// skipped, never raised.
+// skipped, never raised. A failure to enumerate the directory itself is
+// swallowed here — see ListIDEInstancesErr for the error-surfacing variant.
 func ListIDEInstances(claudeDir string) []IdeInstance {
+	out, _ := ListIDEInstancesErr(claudeDir)
+	return out
+}
+
+// ListIDEInstancesErr is ListIDEInstances but surfaces a directory-enumeration
+// error (e.g. an unreadable ide dir) instead of swallowing it. Per-file
+// corruption/read failures are still skipped silently, mirroring Python
+// list_ide_instances.
+func ListIDEInstancesErr(claudeDir string) ([]IdeInstance, error) {
 	out := []IdeInstance{}
 	ideDir := filepath.Join(claudeDir, "ide")
 	info, err := os.Stat(ideDir)
 	if err != nil || !info.IsDir() {
-		return out
+		return out, nil
 	}
-	matches, _ := filepath.Glob(filepath.Join(ideDir, "*.lock"))
-	sort.Strings(matches)
+	matches, err := listDirEntries(ideDir, ".lock")
+	if err != nil {
+		return out, err
+	}
 	for _, path := range matches {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -153,12 +179,51 @@ func ListIDEInstances(claudeDir string) []IdeInstance {
 			WorkspaceFolders: getStringSlice(m, "workspaceFolders"),
 		})
 	}
-	return out
+	return out, nil
 }
 
-// GetRunningInstances returns (ListSessions(claudeDir), ListIDEInstances(claudeDir)).
+// GetRunningInstances returns (ListSessions(claudeDir), ListIDEInstances(claudeDir)),
+// swallowing any directory-enumeration error (the display/render callers do not
+// care why the probe came up empty). GetRunningInstancesErr surfaces it.
 func GetRunningInstances(claudeDir string) ([]ClaudeSession, []IdeInstance) {
-	return ListSessions(claudeDir), ListIDEInstances(claudeDir)
+	sessions, ides, _ := GetRunningInstancesErr(claudeDir)
+	return sessions, ides
+}
+
+// GetRunningInstancesErr is GetRunningInstances but surfaces the first
+// directory-enumeration error from either probe. It underpins the fail-closed
+// owner check (spec 02§13 _active_cc_running): a probe that cannot rule out a
+// running Claude Code must not read as "no owner".
+func GetRunningInstancesErr(claudeDir string) ([]ClaudeSession, []IdeInstance, error) {
+	sessions, err := ListSessionsErr(claudeDir)
+	if err != nil {
+		return sessions, []IdeInstance{}, err
+	}
+	ides, err := ListIDEInstancesErr(claudeDir)
+	if err != nil {
+		return sessions, ides, err
+	}
+	return sessions, ides, nil
+}
+
+// listDirEntries returns the sorted full paths of entries in dir whose name
+// ends in suffix. Unlike filepath.Glob (which silently drops directory-read
+// I/O errors), a failure to read dir surfaces as an error, so callers that
+// must fail closed on an unreadable directory can distinguish "empty" from
+// "could not look".
+func listDirEntries(dir, suffix string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), suffix) {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // decodeObject parses a JSON object, keeping numbers as json.Number so

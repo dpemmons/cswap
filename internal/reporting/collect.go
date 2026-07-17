@@ -236,13 +236,16 @@ func persistPollPlans(
 }
 
 // activeCCRunning reports whether any default-profile Claude Code / live session
-// instance is running (spec 02§13 _active_cc_running). procdetect never raises,
-// so — unlike Python's fail-closed except → True — a genuine probe error surfaces
-// as "no owner" here; procdetect swallows such errors and returns empty by
-// design, and the only divergence is an unreadable sessions dir (permission),
-// which is not a supported cswap host state.
+// instance is running (spec 02§13 _active_cc_running). It fails CLOSED, matching
+// Python's `except Exception: return True`: if the instance probe cannot be
+// completed — e.g. the sessions/ide directory is unreadable — assume an owner
+// may exist so we never refresh the live credential out from under a running
+// Claude Code. Only a probe that completes and finds nothing returns false.
 func activeCCRunning(s *store.Store) bool {
-	sessions, ides := procdetect.GetRunningInstances(procdetect.GetClaudeDir())
+	sessions, ides, err := procdetect.GetRunningInstancesErr(procdetect.GetClaudeDir())
+	if err != nil {
+		return true
+	}
 	return len(sessions) > 0 || len(ides) > 0
 }
 

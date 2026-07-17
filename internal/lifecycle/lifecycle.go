@@ -59,10 +59,20 @@ var ActivePrompter Prompter = StdPrompter{}
 // ambiguous-email flow) don't drop buffered bytes.
 var stdinReader = bufio.NewReader(os.Stdin)
 
-// StdPrompter is the production Prompter over os.Stdin/Output. Secret does NOT
-// hide echo (no x/term dependency is permitted, DESIGN A12); the CLI may inject
-// a stronger getpass. Documented deviation.
+// StdPrompter is the production Prompter over os.Stdin/Output. Secret suppresses
+// echo when stdin is a terminal via termios/console-mode (getpass parity, spec
+// 01§6.1), through the terminalControl seam below; non-terminal stdin (a pipe)
+// falls back to a plain line read exactly like getpass does.
 type StdPrompter struct{}
+
+// stripInputNewline mirrors Python's universal-newline input(): drop the trailing
+// LF and a single CR immediately before it (CRLF → ""), leaving every other byte
+// intact. It deliberately does NOT TrimSpace — spec 01 compares .lower()=="y", so
+// a "y " answer must remain "y " and fail the match, matching Python.
+func stripInputNewline(line string) string {
+	line = strings.TrimRight(line, "\n")
+	return strings.TrimSuffix(line, "\r")
+}
 
 func (StdPrompter) Prompt(message string) (string, bool) {
 	fmt.Fprint(Output, message)
@@ -70,17 +80,64 @@ func (StdPrompter) Prompt(message string) (string, bool) {
 	if line == "" && err != nil {
 		return "", false
 	}
-	return strings.TrimRight(line, "\n"), true
+	return stripInputNewline(line), true
 }
 
-func (p StdPrompter) Secret(message string) (string, bool) { return p.Prompt(message) }
+// terminalControl abstracts terminal echo control so Secret can be unit-tested
+// without a real pty. The production value (stdTerminal, defined per-platform)
+// drives os.Stdin via termios (unix) / console mode (windows); tests inject a
+// fake through activeTerminal.
+type terminalControl interface {
+	isTerminal() bool
+	// disableEcho turns off input echo and returns a restore closure. It is
+	// called only when isTerminal() reports true.
+	disableEcho() (restore func() error, err error)
+}
+
+// activeTerminal is the terminalControl seam; tests swap it.
+var activeTerminal terminalControl = stdTerminal{}
+
+func (StdPrompter) Secret(message string) (string, bool) {
+	fmt.Fprint(Output, message)
+	// Non-terminal stdin (pipe/redirect): getpass falls back to a plain read
+	// with no suppressed-echo newline to restore.
+	if !activeTerminal.isTerminal() {
+		return readLineFallback()
+	}
+	restore, err := activeTerminal.disableEcho()
+	if err != nil {
+		// Echo control unavailable: read with echo, like getpass's fallback.
+		return readLineFallback()
+	}
+	// Restore echo and print the newline the suppressed Enter-echo swallowed on
+	// every return path, including read-error/interrupt (getpass finally).
+	defer func() {
+		_ = restore()
+		fmt.Fprintln(Output)
+	}()
+	line, rerr := stdinReader.ReadString('\n')
+	if line == "" && rerr != nil {
+		return "", false
+	}
+	return stripInputNewline(line), true
+}
+
+// readLineFallback reads one line from stdinReader with no echo handling and no
+// trailing newline (getpass's non-tty / echo-unavailable fallback).
+func readLineFallback() (string, bool) {
+	line, err := stdinReader.ReadString('\n')
+	if line == "" && err != nil {
+		return "", false
+	}
+	return stripInputNewline(line), true
+}
 
 func (StdPrompter) StdinLine() (string, bool) {
 	line, err := stdinReader.ReadString('\n')
 	if line == "" && err != nil {
 		return "", false
 	}
-	return strings.TrimRight(line, "\n"), true
+	return stripInputNewline(line), true
 }
 
 // emitLine writes one already-styled line to Output.

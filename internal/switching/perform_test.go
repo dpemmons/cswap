@@ -3,11 +3,66 @@ package switching
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
+	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
 )
+
+// TestConfigReadErrorNotFoundOnlyForENOENT: a non-ENOENT read error on
+// ~/.claude.json (here: a directory at the path) must NOT be misreported as
+// "Claude config file not found" — it surfaces with the real cause. Only a
+// genuine absence maps to "not found" (FINDING 10).
+func TestConfigReadErrorNotFoundOnlyForENOENT(t *testing.T) {
+	// A real EISDIR-class error: reading a directory as a file, matching how
+	// readConfigText would fail if ~/.claude.json were a directory.
+	dir := t.TempDir()
+	_, dirErr := os.ReadFile(dir)
+	if dirErr == nil {
+		t.Fatal("reading a directory should have errored")
+	}
+	err := configReadError(dirErr)
+	if err == nil {
+		t.Fatal("configReadError(dir read error) = nil")
+	}
+	if strings.Contains(err.Error(), "not found") {
+		t.Fatalf("directory read error misreported as not-found: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "Failed to read Claude config") {
+		t.Fatalf("error should carry the real cause, got %q", err.Error())
+	}
+	// The underlying cause is preserved on the chain.
+	if !errorsIsCause(err, dirErr) {
+		t.Fatalf("underlying cause not wrapped: %v", err)
+	}
+
+	// A genuine absence still maps to the "not found" message.
+	missing := os.ErrNotExist
+	nf := configReadError(missing)
+	if !strings.Contains(nf.Error(), "Claude config file not found") {
+		t.Fatalf("ENOENT should map to not-found, got %q", nf.Error())
+	}
+	if cerr.TypeName(nf) != "ConfigError" {
+		t.Fatalf("want ConfigError kind, got %q", cerr.TypeName(nf))
+	}
+}
+
+// errorsIsCause reports whether target is somewhere in err's Unwrap chain.
+func errorsIsCause(err, target error) bool {
+	for e := err; e != nil; {
+		if e == target {
+			return true
+		}
+		u, ok := e.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		e = u.Unwrap()
+	}
+	return false
+}
 
 // TestSwitchEmptyCurrentCredsGuard: an empty active-credential read (a Keychain
 // timeout returns "") must NOT overwrite the departing slot's backup — the

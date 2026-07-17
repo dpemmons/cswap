@@ -11,6 +11,7 @@ package switching
 
 import (
 	"os"
+	"sort"
 	"strings"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
@@ -135,11 +136,16 @@ func sortedAccountKeys(data *store.SequenceData) []string {
 		}
 	}
 	// Include any accounts not present in sequence (defensive), lexically last.
+	// Map iteration order is nondeterministic, so sort the tail before appending
+	// to keep the fallback scan reproducible across runs.
+	tail := make([]string, 0, len(data.Accounts))
 	for k := range data.Accounts {
 		if !seen[k] {
-			out = append(out, k)
+			tail = append(tail, k)
 		}
 	}
+	sort.Strings(tail)
+	out = append(out, tail...)
 	return out
 }
 

@@ -192,6 +192,27 @@ func TestTimeoutClassifiedUnusable(t *testing.T) {
 	}
 }
 
+// TestSuccessAtDeadlineHonored pins the fix for the race where a subprocess
+// completes successfully at ~the deadline: the result must be honored, never
+// discarded as a timeout. This mirrors Python's subprocess.run, whose
+// TimeoutExpired fires only when the process is actually killed, not when a
+// result was obtained just as the clock ran out. The fake exec seam returns a
+// successful rc=0 result while the context is already expired.
+func TestSuccessAtDeadlineHonored(t *testing.T) {
+	raced := func(ctx context.Context, argv []string, stdin string) (execResult, error) {
+		<-ctx.Done() // deadline has fired; ctx.Err() == DeadlineExceeded
+		return execResult{rc: 0, stdout: "value\n"}, nil
+	}
+	s := Security{Exec: raced, Timeout: time.Millisecond}
+	val, found, err := s.Get("svc", "acct")
+	if err != nil {
+		t.Fatalf("success at deadline discarded as %v; want honored result", err)
+	}
+	if !found || val != "value" {
+		t.Errorf("Get = (%q,%v), want (\"value\",true)", val, found)
+	}
+}
+
 func TestAccountNamePrefersUSER(t *testing.T) {
 	t.Setenv("USER", "bob")
 	if AccountName() != "bob" {

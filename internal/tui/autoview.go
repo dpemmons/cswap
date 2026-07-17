@@ -170,7 +170,15 @@ func (a *autoScreen) startEngine(m *Model, dryRun bool) tea.Cmd {
 	a.engine = eng
 	go func() {
 		code := eng.RunLoop()
-		ch <- engineStoppedMsg{gen: gen, code: code}
+		// Non-blocking, like onEvent: after restartEngine installs a fresh
+		// channel nobody drains this one, and if its 64-slot buffer is already
+		// full a blocking send would strand this goroutine forever. A stopped
+		// message from a superseded engine is dropped by onEngineMsg's
+		// generation guard anyway, so losing it here is safe.
+		select {
+		case ch <- engineStoppedMsg{gen: gen, code: code}:
+		default:
+		}
 	}()
 	return drainCmd(ch)
 }

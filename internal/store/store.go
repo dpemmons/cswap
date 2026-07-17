@@ -147,6 +147,13 @@ func New(opts Options) (*Store, error) {
 	// directory until the first write, and usage.NewStore does not touch disk —
 	// so a no-op run never materializes backupDir.
 	log := logging.NewWithClock(backupDir, opts.Debug, clk)
+	// Install the store's logger into the oauth package seam so oauth's
+	// WARNING/DEBUG lines (spec 04§1.17 paste-safe usage-failure warnings,
+	// refresh/profile warnings, persist-failure log) land in the log file the
+	// doc comment on oauth.Log promises. oauth.Log is a package-global: with two
+	// stores in-process the last constructed wins, which is benign — both stores
+	// share the same on-disk backup root and therefore the same log file.
+	oauth.Log = log
 	usageStore := usage.NewStore(filepath.Join(backupDir, "cache"), clk)
 
 	// (6) credential store — constructed BEFORE run_migrations because the macOS

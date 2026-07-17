@@ -393,13 +393,27 @@ func sortedSlotKeys(data *SequenceData) []string {
 	for k := range data.Accounts {
 		keys = append(keys, k)
 	}
+	// Total order: numeric keys first (by value, tie-broken lexicographically for
+	// stability), then non-numeric keys lexicographically. A plain
+	// numeric-or-lexicographic branch is intransitive on a mixed set like
+	// "15"/"3"/"2abc" (3<15, 2abc<3, 15<2abc), which sort.Slice may resolve
+	// nondeterministically.
 	sort.Slice(keys, func(i, j int) bool {
 		ni, oki := atoiSlot(keys[i])
 		nj, okj := atoiSlot(keys[j])
-		if oki && okj {
-			return ni < nj
+		switch {
+		case oki && okj:
+			if ni != nj {
+				return ni < nj
+			}
+			return keys[i] < keys[j]
+		case oki: // keys[i] numeric, keys[j] not: numerics first
+			return true
+		case okj: // keys[j] numeric, keys[i] not: numerics first
+			return false
+		default:
+			return keys[i] < keys[j]
 		}
-		return keys[i] < keys[j]
 	})
 	return keys
 }

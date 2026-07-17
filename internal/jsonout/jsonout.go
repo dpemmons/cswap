@@ -12,6 +12,7 @@ package jsonout
 
 import (
 	"math"
+	"strconv"
 	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
@@ -187,9 +188,19 @@ func isoUTCSeconds(unix float64) string {
 	return t.Format("2006-01-02T15:04:05") + "Z"
 }
 
-// round1 rounds to one decimal place, matching Python round(x, 1).
+// round1 rounds to one decimal place, matching Python round(x, 1) exactly.
+//
+// Python's round is banker's rounding (round-half-to-even) applied to the exact
+// binary value of the float, not naive half-away-from-zero (math.Round). Because
+// most one-decimal literals are not exactly representable, the tie cases usually
+// resolve by which side of the midpoint the stored double actually lands on
+// (e.g. 0.15 is stored just below 0.15, so it rounds down to 0.1). Go's
+// strconv.FormatFloat with 'f' and precision 1 performs the identical
+// correctly-rounded, round-half-to-even conversion on the exact value, so
+// formatting to one digit and parsing back reproduces Python bit for bit.
 func round1(x float64) float64 {
-	return math.Round(x*10) / 10
+	v, _ := strconv.ParseFloat(strconv.FormatFloat(x, 'f', 1, 64), 64)
+	return v
 }
 
 // AccountRow builds a full account row for --list.

@@ -12,6 +12,7 @@ package tui
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"git.dpemmons.com/dpemmons/cswap/internal/autoswitch"
+	"git.dpemmons.com/dpemmons/cswap/internal/lifecycle"
+	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
 	"git.dpemmons.com/dpemmons/cswap/internal/reporting"
 )
 
@@ -122,12 +126,38 @@ func newModel(f Facade, start string, opts ...Option) *Model {
 // run). start is "dashboard" or "watch".
 func Run(f Facade, start string, opts ...Option) int {
 	m := newModel(f, start, opts...)
+	// While bubbletea holds the raw-mode alt-screen, silence the human-output
+	// seams the mutating lifecycle ops and the oauth persist-failure path write
+	// to; otherwise their stdout text corrupts the display. The facade already
+	// returns structured results the TUI renders itself (spec 09§11.4 /
+	// Deviation #7), so this printed text is redundant here.
+	restore := redirectHumanOutput()
+	defer restore()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	final, err := p.Run()
 	if err != nil {
 		return 1
 	}
 	return final.(*Model).returnCode
+}
+
+// redirectHumanOutput points the package-level human-output seams
+// (lifecycle.Output, oauth.Output) at io.Discard for the duration of a TUI
+// session and returns a closure that restores their previous values. It is the
+// single place the TUI owns those seams (spec 09§11.4 / Deviation #7): mutating
+// results reach the UI as structured payloads, so the redundant printed lines —
+// including the always-emitted "Slot N already occupied" warning, which already
+// routes through lifecycle.Output — must not reach the terminal underneath the
+// alt-screen.
+func redirectHumanOutput() func() {
+	prevLifecycle := lifecycle.Output
+	prevOAuth := oauth.Output
+	lifecycle.Output = io.Discard
+	oauth.Output = io.Discard
+	return func() {
+		lifecycle.Output = prevLifecycle
+		oauth.Output = prevOAuth
+	}
 }
 
 // Init fires the immediate refresh and arms the periodic poll (09§2.2: the
@@ -376,7 +406,10 @@ func switchTarget(payload map[string]any) string {
 			return email
 		}
 		if num := to["number"]; num != nil {
-			return "account " + numberString(num)
+			// number arrives as a *int (jsonout.AccountRef) for a real switch or
+			// a plain int (dry-run refOf); AccountNumberStr renders both, where
+			// the naive %v of the local helper printed a *int's pointer address.
+			return "account " + autoswitch.AccountNumberStr(num)
 		}
 	}
 	return "account <nil>"
@@ -625,19 +658,4 @@ func truthy(v any) bool {
 		return x != 0
 	}
 	return true
-}
-
-// numberString renders a JSON number (float64/int) without a trailing ".0".
-func numberString(v any) string {
-	switch n := v.(type) {
-	case float64:
-		return strconv.FormatFloat(n, 'f', -1, 64)
-	case int:
-		return strconv.Itoa(n)
-	case int64:
-		return strconv.FormatInt(n, 10)
-	case string:
-		return n
-	}
-	return fmt.Sprintf("%v", v)
 }
