@@ -27,3 +27,20 @@ func isPIDAliveNative(pid int) bool {
 	}
 	return false
 }
+
+// ignoreStatError reports whether an os.Stat error means "the path can't name a
+// directory" (so it should be treated as absent) rather than "the lookup itself
+// failed". It mirrors pathlib's _IGNORED_ERRNOS: ENOENT/ENOTDIR/EBADF/ELOOP are
+// ignored; everything else (notably EACCES on an unreadable parent) is surfaced.
+// A stat error carrying no errno is treated as non-ignorable so it fails closed.
+func ignoreStatError(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch errno {
+	case syscall.ENOENT, syscall.ENOTDIR, syscall.EBADF, syscall.ELOOP:
+		return true
+	}
+	return false
+}

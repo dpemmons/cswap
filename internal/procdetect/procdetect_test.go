@@ -277,6 +277,45 @@ func TestGetRunningInstances_EmptyWhenNoDirs(t *testing.T) {
 	}
 }
 
+// TestGetRunningInstancesErr_UnreadableParentSurfacesError pins the fail-closed
+// behaviour: when the sessions/ide directory exists but its parent's search
+// (execute) bit is cleared, os.Stat on the subdirectory fails with EACCES.
+// pathlib's is_dir() would re-raise that (EACCES is outside its ignore set), so
+// the Err variant must surface the error rather than swallow it as "empty" —
+// that error is what makes reporting's activeCCRunning fail CLOSED. The legacy
+// swallow variant still returns empty.
+func TestGetRunningInstancesErr_UnreadableParentSurfacesError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory search-permission checks; EACCES not reproducible")
+	}
+	dir := t.TempDir()
+	sessionsDir := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Clear the parent's execute/search bit so stat of the subdirectory yields
+	// EACCES. Restore it in cleanup so t.TempDir removal can succeed.
+	if err := os.Chmod(dir, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	if _, err := ListSessionsErr(dir); err == nil {
+		t.Error("ListSessionsErr returned nil error on unreadable parent; want EACCES surfaced")
+	}
+
+	_, _, err := GetRunningInstancesErr(dir)
+	if err == nil {
+		t.Fatal("GetRunningInstancesErr returned nil error on unreadable parent; want EACCES surfaced")
+	}
+
+	// The legacy swallow variant must still return empty, never error out.
+	if sessions, ides := GetRunningInstances(dir); len(sessions)+len(ides) != 0 {
+		t.Errorf("GetRunningInstances returned %d sessions, %d ides; want 0, 0 (error swallowed)",
+			len(sessions), len(ides))
+	}
+}
+
 func TestGetClaudeDir_RespectsEnvVar(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)

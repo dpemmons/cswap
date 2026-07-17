@@ -28,6 +28,40 @@ func TestFormatRecoveryISORoundsMicroseconds(t *testing.T) {
 	}
 }
 
+// TestFormatRecoveryISOBankersRounding pins Finding 12: CPython's
+// datetime.fromtimestamp rounds the microsecond conversion round-half-to-even
+// (banker's rounding on the exact binary value), not half-away-from-zero
+// (math.Round). Two exact-tie cases straddle the even/odd boundary and one
+// non-tie case is a control.
+//
+// Ground truth (python3):
+//
+//	>>> from datetime import datetime, timezone
+//	>>> f = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat().replace('+00:00','Z')
+//	>>> f(1700000000.0078125)   # 0.0078125*1e6 == 7812.5  exactly -> even 7812
+//	'2023-11-14T22:13:20.007812Z'
+//	>>> f(1700000000.0234375)   # 0.0234375*1e6 == 23437.5 exactly -> even 23438
+//	'2023-11-14T22:13:20.023438Z'
+//	>>> f(1700000000.1234567)   # non-tie control
+//	'2023-11-14T22:13:20.123457Z'
+//
+// math.Round would give ...007813Z (up from the .5 tie) instead of ...007812Z.
+func TestFormatRecoveryISOBankersRounding(t *testing.T) {
+	cases := []struct {
+		epoch float64
+		want  string
+	}{
+		{1700000000.0078125, "2023-11-14T22:13:20.007812Z"}, // tie -> down to even
+		{1700000000.0234375, "2023-11-14T22:13:20.023438Z"}, // tie -> up to even
+		{1700000000.1234567, "2023-11-14T22:13:20.123457Z"}, // non-tie control
+	}
+	for _, c := range cases {
+		if got := formatRecoveryISO(c.epoch); got != c.want {
+			t.Errorf("formatRecoveryISO(%v) = %q, want %q", c.epoch, got, c.want)
+		}
+	}
+}
+
 // TestSwitchHumanRealRefShape pins Finding 5: a real (non-dry-run) switch's
 // from/to refs come from jsonout.AccountRef, whose "number" is a *int. Human()
 // must render the slot number, not the pointer address. A nil *int (unmanaged

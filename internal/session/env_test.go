@@ -96,9 +96,13 @@ func TestSetupEnvReturnsScrubListAndWarns(t *testing.T) {
 		t.Errorf("Scrubbed = %v, want %v", res.Scrubbed, want)
 	}
 	sink := buf.String()
-	if !strings.Contains(sink, "Ignoring") ||
+	// D3 (FINDING 13): the env scrub warning names the vars, states plainly they
+	// are removed for the WHOLE shell, and says they must be re-exported.
+	if !strings.Contains(sink, "Removing") ||
 		!strings.Contains(sink, "ANTHROPIC_API_KEY") ||
-		!strings.Contains(sink, "CLAUDE_CODE_OAUTH_TOKEN") {
+		!strings.Contains(sink, "CLAUDE_CODE_OAUTH_TOKEN") ||
+		!strings.Contains(sink, "WHOLE shell") ||
+		!strings.Contains(sink, "re-export") {
 		t.Errorf("scrub warning missing/incomplete on notice sink: %q", sink)
 	}
 	if len(runner.execCalls) != 0 {
@@ -106,19 +110,19 @@ func TestSetupEnvReturnsScrubListAndWarns(t *testing.T) {
 	}
 }
 
-// TestSetupEnvSameAccountPreparesWithoutExec: when the requested account is
-// already the active default login (and CLAUDE_CONFIG_DIR is unset), env does
-// NOT take run's exec fast path — it prints an informational note and still
-// prepares + returns the profile.
-func TestSetupEnvSameAccountPreparesWithoutExec(t *testing.T) {
+// TestSetupEnvSameAccountIsNoOp: D1 (FINDING 1). When the requested account is
+// already the active default login and CLAUDE_CONFIG_DIR is unset, env performs
+// NO bootstrap and emits NO export — it never execs (unlike run's fast path),
+// creates no second credential copy, and returns a NoOp result carrying only the
+// resolved identity plus an informational note on the sink.
+func TestSetupEnvSameAccountIsNoOp(t *testing.T) {
 	setupHome(t)
 	backup := t.TempDir()
 	accts := newFakeAccounts(backup, platform.Linux)
 	accts.add("2", "user@example.com", "", oauthCreds)
 	two := "2"
 	accts.current = &two
-	wantDir := sessionDirFor(t, backup, "2", "user@example.com")
-	seedProfile(t, wantDir, "user@example.com", "", oauthCreds, nil)
+	dir := sessionDirFor(t, backup, "2", "user@example.com")
 
 	runner := &fakeRunner{probeFn: profileProbe}
 	m, buf := newManager(t, accts, Options{
@@ -133,11 +137,59 @@ func TestSetupEnvSameAccountPreparesWithoutExec(t *testing.T) {
 	if len(runner.execCalls) != 0 {
 		t.Fatalf("SetupEnv execed on the same-account path (calls=%d); it must not", len(runner.execCalls))
 	}
-	if res.Dir != wantDir {
-		t.Errorf("Dir = %q, want %q (still emits the profile)", res.Dir, wantDir)
+	if !res.NoOp {
+		t.Errorf("res.NoOp = false, want true (D1: no bootstrap, no export)")
 	}
-	if !strings.Contains(buf.String(), "already the active default login") {
-		t.Errorf("missing informational same-account note: %q", buf.String())
+	if res.Dir != "" {
+		t.Errorf("res.Dir = %q, want empty (nothing prepared)", res.Dir)
+	}
+	if res.AccountNum != "2" || res.Email != "user@example.com" {
+		t.Errorf("NoOp result identity = (%s,%s), want (2,user@example.com)", res.AccountNum, res.Email)
+	}
+	if len(accts.written) != 0 {
+		t.Errorf("credential writes = %d, want 0 (D1 creates no second copy)", len(accts.written))
+	}
+	if fileExists(dir) {
+		t.Errorf("SetupEnv materialized a profile at %q; D1 must prepare nothing", dir)
+	}
+	sink := buf.String()
+	if !strings.Contains(sink, "active default login") || !strings.Contains(sink, "nothing exported") {
+		t.Errorf("missing D1 no-op note (naming default login + nothing exported): %q", sink)
+	}
+}
+
+// TestSetupEnvSameAccountWithPresetPrepares: D1's no-op is gated on NO
+// CLAUDE_CONFIG_DIR preset. With a preset set, the same-account identity match
+// does NOT no-op — env overrides the preset and prepares + exports the profile
+// (parity with run's preset handling).
+func TestSetupEnvSameAccountWithPresetPrepares(t *testing.T) {
+	setupHome(t)
+	backup := t.TempDir()
+	accts := newFakeAccounts(backup, platform.Linux)
+	accts.add("2", "user@example.com", "", oauthCreds)
+	two := "2"
+	accts.current = &two
+	wantDir := sessionDirFor(t, backup, "2", "user@example.com")
+	seedProfile(t, wantDir, "user@example.com", "", oauthCreds, nil)
+
+	runner := &fakeRunner{probeFn: profileProbe}
+	m, buf := newManager(t, accts, Options{
+		Runner:  runner,
+		Environ: func() []string { return []string{"PATH=/usr/bin", "CLAUDE_CONFIG_DIR=/somewhere/else"} },
+	})
+
+	res, err := m.SetupEnv("2", false, false)
+	if err != nil {
+		t.Fatalf("SetupEnv: %v", err)
+	}
+	if res.NoOp {
+		t.Fatalf("res.NoOp = true; a preset must override the D1 no-op")
+	}
+	if res.Dir != wantDir {
+		t.Errorf("Dir = %q, want %q (preset overridden, profile prepared)", res.Dir, wantDir)
+	}
+	if !strings.Contains(buf.String(), "CLAUDE_CONFIG_DIR is already set") {
+		t.Errorf("missing preset-override warning: %q", buf.String())
 	}
 }
 

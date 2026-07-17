@@ -139,60 +139,110 @@ func NewManager(accounts Accounts, opts Options) *Manager {
 	return m
 }
 
+// setupMode captures the handful of run-vs-env differences the shared setup
+// path (setupPreamble + setupBootstrap) is parameterized by: the status-notice
+// verb, and the message templates whose wording differs between a launch
+// ("this session") and an export ("this shell"). See setupPreamble.
+type setupMode struct {
+	verb           string // status-notice verb ("Launching" / "Prepared")
+	presetOverride string // CLAUDE_CONFIG_DIR-preset warning; one %s (the preset)
+	sameActiveNote string // note when the account is already the active default and no preset; two %s (num, email)
+	scrubIgnore    string // auth-override scrub warning; one %s (the joined var names)
+}
+
+var (
+	runMode = setupMode{
+		verb:           "Launching",
+		presetOverride: "CLAUDE_CONFIG_DIR is already set (%s); overriding it for this launch.",
+		sameActiveNote: "Account-%s (%s) is already the active default login — launching claude directly.",
+		scrubIgnore:    "Ignoring %s for this session — it would override the selected account inside Claude Code.",
+	}
+	envMode = setupMode{
+		verb:           "Prepared",
+		presetOverride: "CLAUDE_CONFIG_DIR is already set (%s); this export overrides it for this shell.",
+		sameActiveNote: "Account-%s (%s) is the active default login — an unpinned shell already uses it; nothing exported.",
+		scrubIgnore: "Removing %s for this shell — these override the selected account inside Claude Code. " +
+			"They are unset for the WHOLE shell (not just cswap); re-export them to restore.",
+	}
+)
+
+// setupPreamble runs the shared Run/SetupEnv front matter: locate claude, apply
+// the Windows share-history guard, resolve the account, reject API-key accounts,
+// and classify the CLAUDE_CONFIG_DIR-preset / same-active-default situation. It
+// emits the preset-override warning (when a preset is present) or the
+// same-active-default note (when the requested account is already the live
+// default login and no preset is set) — the two points where Run execs directly
+// and env no-ops (D1 / FINDING 1). sameActive reports that second case; the
+// caller owns the exec-vs-no-op decision, and the note has already been printed.
+// Nothing here bootstraps a profile.
+func (m *Manager) setupPreamble(identifier string, shareHistory bool, mode setupMode) (claudeBin, accountNum, email string, sameActive bool, err error) {
+	bin, lookErr := m.runner.LookPath("claude")
+	if lookErr != nil || bin == "" {
+		return "", "", "", false, errClaudeNotFound()
+	}
+	if shareHistory && m.accounts.Platform() == platform.Windows {
+		return "", "", "", false, errShareHistoryWindows()
+	}
+	num, mail, _, rerr := m.accounts.ResolveAccount(identifier)
+	if rerr != nil {
+		return "", "", "", false, rerr
+	}
+	// Guard before any exec/no-op decision and before setup_session.
+	if aerr := m.ensureNotAPIKey(num, mail); aerr != nil {
+		return "", "", "", false, aerr
+	}
+
+	if preset := m.getenv("CLAUDE_CONFIG_DIR"); preset != "" {
+		// "current default account" is meaningless once CLAUDE_CONFIG_DIR is set
+		// (we may already be inside a session), so neither the fast path nor the
+		// D1 no-op triggers even on an identity match — the preset is overridden
+		// and the profile prepared.
+		m.warn(fmt.Sprintf(mode.presetOverride, preset))
+	} else if cur := m.accounts.CurrentAccountNumber(); cur != nil && *cur == num {
+		m.println(printer.Dimmed(fmt.Sprintf(mode.sameActiveNote, num, mail)))
+		return bin, num, mail, true, nil
+	}
+	return bin, num, mail, false, nil
+}
+
+// setupBootstrap runs the shared scrub-warn → SetupSession → status-notice tail
+// both Run and SetupEnv execute once past the preamble's same-active-default
+// branch. It returns the prepared profile dir, the resolved identity, and the
+// AUTH_OVERRIDE_ENV_VARS that were present (for env's unset lines; Run scrubs
+// them from the launch env directly).
+func (m *Manager) setupBootstrap(identifier string, share, shareHistory bool, mode setupMode) (sessionDir, accountNum, email string, scrubbed []string, err error) {
+	scrubbed = m.scrubbedPresent()
+	if len(scrubbed) > 0 {
+		m.warn(fmt.Sprintf(mode.scrubIgnore, strings.Join(scrubbed, ", ")))
+	}
+	dir, num, mail, serr := m.SetupSession(identifier, share, shareHistory)
+	if serr != nil {
+		return "", "", "", nil, serr
+	}
+	m.println(fmt.Sprintf("%s Account-%s (%s) %s",
+		printer.Accent(mode.verb), num, mail, printer.Muted("[session mode]")))
+	return dir, num, mail, scrubbed, nil
+}
+
 // Run launches Claude Code as the given account in the current terminal. On
 // POSIX it execs and never returns on success; with a mocked runner it returns
 // nil after recording the exec.
 func (m *Manager) Run(identifier string, claudeArgs []string, share, shareHistory bool) error {
-	claudeBin, err := m.runner.LookPath("claude")
-	if err != nil || claudeBin == "" {
-		return errClaudeNotFound()
-	}
-	if shareHistory && m.accounts.Platform() == platform.Windows {
-		return cerr.Session(
-			"--share-history is not supported on Windows yet: sharing uses " +
-				"re-synced copies there, which would fork the history instead " +
-				"of sharing it.")
-	}
-
-	accountNum, email, _, err := m.accounts.ResolveAccount(identifier)
+	claudeBin, _, _, sameActive, err := m.setupPreamble(identifier, shareHistory, runMode)
 	if err != nil {
 		return err
 	}
-	// Guard before the same-account fast path (which execs and never returns)
-	// and before setup_session.
-	if err := m.ensureNotAPIKey(accountNum, email); err != nil {
-		return err
-	}
-
-	if preset := m.getenv("CLAUDE_CONFIG_DIR"); preset != "" {
-		// "current default account" is meaningless once CLAUDE_CONFIG_DIR is
-		// set (we may already be inside a session), so the fast path must not
-		// trigger even on an identity match.
-		m.warn(fmt.Sprintf(
-			"CLAUDE_CONFIG_DIR is already set (%s); overriding it for this launch.", preset))
-	} else if cur := m.accounts.CurrentAccountNumber(); cur != nil && *cur == accountNum {
+	if sameActive {
 		// Same-account fast path: never create a second credential copy for the
-		// account that is already the active default login (two copies can
-		// drift on refresh-token rotation).
-		m.println(printer.Dimmed(fmt.Sprintf(
-			"Account-%s (%s) is already the active default login — launching claude directly.",
-			accountNum, email)))
+		// account that is already the active default login (two copies can drift
+		// on refresh-token rotation). The note was printed by the preamble.
 		return m.exec(claudeBin, claudeArgs, m.environ())
 	}
 
-	if scrubbed := m.scrubbedPresent(); len(scrubbed) > 0 {
-		m.warn(fmt.Sprintf(
-			"Ignoring %s for this session — it would override the selected account inside Claude Code.",
-			strings.Join(scrubbed, ", ")))
-	}
-
-	sessionDir, accountNum, email, err := m.SetupSession(identifier, share, shareHistory)
+	sessionDir, _, _, _, err := m.setupBootstrap(identifier, share, shareHistory, runMode)
 	if err != nil {
 		return err
 	}
-
-	m.println(fmt.Sprintf("%s Account-%s (%s) %s",
-		printer.Accent("Launching"), accountNum, email, printer.Muted("[session mode]")))
 
 	env := setEnvVar(scrubEnv(m.environ(), AuthOverrideEnvVars), "CLAUDE_CONFIG_DIR", sessionDir)
 	return m.exec(claudeBin, claudeArgs, env)
@@ -232,6 +282,15 @@ func (m *Manager) ensureNotAPIKey(accountNum, email string) error {
 
 func errClaudeNotFound() error {
 	return cerr.Session("'claude' was not found on PATH. Install Claude Code first.")
+}
+
+// errShareHistoryWindows is the shared Run/SetupEnv rejection of --share-history
+// on Windows (sharing re-syncs copies there, which would fork history).
+func errShareHistoryWindows() error {
+	return cerr.Session(
+		"--share-history is not supported on Windows yet: sharing uses " +
+			"re-synced copies there, which would fork the history instead " +
+			"of sharing it.")
 }
 
 // scrubbedPresent returns the AUTH_OVERRIDE_ENV_VARS that are currently set

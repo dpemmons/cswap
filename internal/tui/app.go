@@ -82,8 +82,9 @@ type Model struct {
 	lastRefreshError string
 	thresholdPct     *float64
 
-	stack  []screen
-	toasts []toast
+	stack   []screen
+	toasts  []toast
+	notices *noticeCollector
 
 	width, height int
 	toastSeq      int
@@ -103,9 +104,10 @@ func WithEngineFactory(fn EngineFactory) Option { return func(m *Model) { m.newE
 // loaded once from settings; any load failure falls back to nil (bare except).
 func newModel(f Facade, start string, opts ...Option) *Model {
 	m := &Model{
-		facade: f,
-		source: snapshotSource{facade: f},
-		start:  start,
+		facade:  f,
+		source:  snapshotSource{facade: f},
+		start:   start,
+		notices: &noticeCollector{},
 	}
 	for _, o := range opts {
 		o(m)
@@ -131,7 +133,7 @@ func Run(f Facade, start string, opts ...Option) int {
 	// to; otherwise their stdout text corrupts the display. The facade already
 	// returns structured results the TUI renders itself (spec 09§11.4 /
 	// Deviation #7), so this printed text is redundant here.
-	restore := redirectHumanOutput()
+	restore := redirectHumanOutput(m.notices)
 	defer restore()
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	final, err := p.Run()
@@ -141,23 +143,39 @@ func Run(f Facade, start string, opts ...Option) int {
 	return final.(*Model).returnCode
 }
 
-// redirectHumanOutput points the package-level human-output seams
-// (lifecycle.Output, oauth.Output) at io.Discard for the duration of a TUI
-// session and returns a closure that restores their previous values. It is the
-// single place the TUI owns those seams (spec 09§11.4 / Deviation #7): mutating
-// results reach the UI as structured payloads, so the redundant printed lines —
-// including the always-emitted "Slot N already occupied" warning, which already
-// routes through lifecycle.Output — must not reach the terminal underneath the
-// alt-screen.
-func redirectHumanOutput() func() {
-	prevLifecycle := lifecycle.Output
-	prevOAuth := oauth.Output
-	lifecycle.Output = io.Discard
-	oauth.Output = io.Discard
+// redirectHumanOutput retargets the package-level human-output seams for the
+// duration of a TUI session and returns a closure that restores them. It uses
+// each package's RedirectOutput, which swaps the destination atomically, so the
+// redirect/restore never races the auto-switch engine goroutine writing a
+// warning concurrently (FINDING 5: Engine.Stop does not join its goroutine).
+//
+// lifecycle output goes to io.Discard: its lines are the human CLI echoes of the
+// mutating ops, redundant here because the facade returns structured results the
+// TUI renders itself (spec 09§11.4 / Deviation #7) and every lifecycle warning
+// also reaches the persistent log. oauth output is NOT discarded (FINDING 6):
+// the persist-failure warning is the only user-visible surface for a lost-
+// refresh-token condition (04§1.25), so it is routed into notices, whose lines
+// the Update goroutine drains into warning toasts.
+func redirectHumanOutput(notices *noticeCollector) func() {
+	restoreLifecycle := lifecycle.RedirectOutput(io.Discard)
+	restoreOAuth := oauth.RedirectOutput(notices)
 	return func() {
-		lifecycle.Output = prevLifecycle
-		oauth.Output = prevOAuth
+		restoreOAuth()
+		restoreLifecycle()
 	}
+}
+
+// drainNotices turns any collected human-output warnings (the oauth persist-
+// failure line) into warning toasts. Called on the Update goroutine.
+func (m *Model) drainNotices() []tea.Cmd {
+	if m.notices == nil {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, line := range m.notices.drain() {
+		cmds = append(cmds, m.notify(line, "", "warning"))
+	}
+	return cmds
 }
 
 // Init fires the immediate refresh and arms the periodic poll (09§2.2: the
@@ -175,13 +193,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case pollTickMsg:
-		return m, tea.Batch(m.tickRefresh(), pollTickCmd())
+		cmds := []tea.Cmd{m.tickRefresh(), pollTickCmd()}
+		cmds = append(cmds, m.drainNotices()...)
+		return m, tea.Batch(cmds...)
 
 	case refreshDoneMsg:
 		return m, m.applySnapshot(msg.snap)
 
 	case actionDoneMsg:
-		return m, m.actionDone(msg)
+		cmds := append([]tea.Cmd{m.actionDone(msg)}, m.drainNotices()...)
+		return m, tea.Batch(cmds...)
 
 	case flashClearMsg:
 		return m, m.routeToObservers(msg)

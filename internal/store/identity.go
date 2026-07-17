@@ -11,13 +11,13 @@ package store
 import (
 	"encoding/json"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/ccfile"
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
 	"git.dpemmons.com/dpemmons/cswap/internal/paths"
+	"git.dpemmons.com/dpemmons/cswap/internal/slotkey"
 )
 
 // SequenceMigrated returns sequence.json after ensuring the org-field backfill
@@ -385,35 +385,13 @@ func (s *Store) SwitchableAccountNumbers() []string {
 	return out
 }
 
-// sortedSlotKeys returns the account map keys in ascending numeric order
-// (falling back to lexical order for non-numeric keys), for deterministic
-// iteration where Python relied on dict insertion order.
+// sortedSlotKeys returns the account map keys in the canonical slot-key total
+// order (numerics first by value, then non-numerics lexicographically), for
+// deterministic iteration where Python relied on dict insertion order.
 func sortedSlotKeys(data *SequenceData) []string {
 	keys := make([]string, 0, len(data.Accounts))
 	for k := range data.Accounts {
 		keys = append(keys, k)
 	}
-	// Total order: numeric keys first (by value, tie-broken lexicographically for
-	// stability), then non-numeric keys lexicographically. A plain
-	// numeric-or-lexicographic branch is intransitive on a mixed set like
-	// "15"/"3"/"2abc" (3<15, 2abc<3, 15<2abc), which sort.Slice may resolve
-	// nondeterministically.
-	sort.Slice(keys, func(i, j int) bool {
-		ni, oki := atoiSlot(keys[i])
-		nj, okj := atoiSlot(keys[j])
-		switch {
-		case oki && okj:
-			if ni != nj {
-				return ni < nj
-			}
-			return keys[i] < keys[j]
-		case oki: // keys[i] numeric, keys[j] not: numerics first
-			return true
-		case okj: // keys[j] numeric, keys[i] not: numerics first
-			return false
-		default:
-			return keys[i] < keys[j]
-		}
-	})
-	return keys
+	return slotkey.Sorted(keys)
 }

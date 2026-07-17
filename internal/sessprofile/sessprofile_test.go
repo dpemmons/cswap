@@ -381,3 +381,55 @@ func TestReadSessionCredentials_NoCredentialMaterialReturnsNotOK(t *testing.T) {
 		t.Error("expected ok=false when there is no readable credential material")
 	}
 }
+
+// --- IsSessionProfileDir (D2 / FINDING 2 detection) ---
+
+func TestIsSessionProfileDir(t *testing.T) {
+	backup := t.TempDir()
+	profile := SessionDirFor(backup, "2", "user@example.com")
+	if err := os.MkdirAll(profile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name      string
+		backup    string
+		configDir string
+		want      bool
+	}{
+		{"exact session profile", backup, profile, true},
+		{"deeper descendant", backup, filepath.Join(profile, "sessions", "1234.json"), true},
+		{"a-not-yet-created profile", backup, SessionDirFor(backup, "5", "other@x.com"), true},
+		{"sessions dir itself is not a profile", backup, filepath.Join(backup, "sessions"), false},
+		{"sibling of sessions dir", backup, filepath.Join(backup, "cache"), false},
+		{"unrelated custom dir", backup, filepath.Join(t.TempDir(), "my-config"), false},
+		{"empty configDir", backup, "", false},
+		{"empty backupRoot", "", profile, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsSessionProfileDir(tc.backup, tc.configDir); got != tc.want {
+				t.Errorf("IsSessionProfileDir(%q, %q) = %v, want %v", tc.backup, tc.configDir, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsSessionProfileDir_SymlinkedBackupRoot: a session profile referenced
+// through a symlinked backup root still matches (both sides are symlink-resolved).
+func TestIsSessionProfileDir_SymlinkedBackupRoot(t *testing.T) {
+	real := t.TempDir()
+	profile := SessionDirFor(real, "2", "user@example.com")
+	if err := os.MkdirAll(profile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "backup-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	// configDir addressed via the symlink, backup root via the real path.
+	viaLink := SessionDirFor(link, "2", "user@example.com")
+	if !IsSessionProfileDir(real, viaLink) {
+		t.Errorf("symlinked profile path %q not detected under real root %q", viaLink, real)
+	}
+}

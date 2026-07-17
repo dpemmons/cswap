@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -83,6 +84,46 @@ func isSlugSafe(ch rune) bool {
 // nesting is intentional, not a bug.
 func SessionDirFor(backupDir, accountNum, email string) string {
 	return filepath.Join(backupDir, "sessions", accountNum+"-"+SlugifyEmail(email))
+}
+
+// IsSessionProfileDir reports whether configDir is a `cswap env`/`cswap run`
+// session profile — i.e. it resolves to a path strictly inside
+// <backupRoot>/sessions/. The cli front controller uses it to detect a shell
+// pinned via `cswap env` (whose CLAUDE_CONFIG_DIR points at such a profile) so
+// non-env/run commands can fall back to the default login (D2 / FINDING 2).
+//
+// Both paths are symlink-resolved when they exist (a symlinked backup root
+// still matches), falling back to a lexical absolute-clean when resolution
+// fails. An empty configDir or backupRoot never matches, and the sessions/
+// directory itself (the boundary, not a profile) does not match — only a strict
+// descendant does.
+func IsSessionProfileDir(backupRoot, configDir string) bool {
+	if backupRoot == "" || configDir == "" {
+		return false
+	}
+	sessionsRoot := resolveProfilePath(filepath.Join(backupRoot, "sessions"))
+	target := resolveProfilePath(configDir)
+	rel, err := filepath.Rel(sessionsRoot, target)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
+// resolveProfilePath returns p's canonical form for containment comparison:
+// EvalSymlinks when it resolves, else a lexical absolute-clean (so a
+// not-yet-created path still compares correctly).
+func resolveProfilePath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return filepath.Clean(p)
 }
 
 // KeychainServiceName returns the Keychain service name Claude Code derives

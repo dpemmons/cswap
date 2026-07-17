@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 
+	"git.dpemmons.com/dpemmons/cswap/internal/paths"
 	"git.dpemmons.com/dpemmons/cswap/internal/printer"
+	"git.dpemmons.com/dpemmons/cswap/internal/sessprofile"
 )
 
 // ioStreams bundles the CLI's own I/O (the switcher's human output still goes
@@ -36,6 +38,14 @@ func Main() int {
 
 // run is the testable front controller. argv excludes the program name.
 func run(prog string, argv []string, s ioStreams, stdinTTY, stdoutTTY bool) int {
+	// D2 (FINDING 2): a shell pinned via `cswap env` carries CLAUDE_CONFIG_DIR
+	// pointing at a cswap session profile. Every command EXCEPT `env`/`run`
+	// (which own their own preset handling) should operate on the DEFAULT login,
+	// not the pinned profile, so neutralize the pin here BEFORE any dispatch.
+	if len(argv) == 0 || (argv[0] != "run" && argv[0] != "env") {
+		neutralizePinnedSessionProfile(s.err)
+	}
+
 	// Pre-dispatch on the first token (spec 08§1 step 4). Each must be the
 	// first argument (DESIGN Deviation 10): `cswap --debug run 2` is unsupported.
 	if len(argv) > 0 {
@@ -80,6 +90,27 @@ func run(prog string, argv []string, s ioStreams, stdinTTY, stdoutTTY bool) int 
 	}
 	setSigintJSON(pr.p.json)
 	return dispatchMain(prog, pr.p, s)
+}
+
+// neutralizePinnedSessionProfile implements D2 (FINDING 2): when the process's
+// CLAUDE_CONFIG_DIR points at a cswap session profile (a shell pinned via
+// `cswap env`), clear it from the process environment so paths.GetClaudeConfigHome
+// resolves the DEFAULT config home everywhere downstream — no flag threading —
+// and print exactly one note. Unsetting the env var is the cleanest mechanism:
+// it makes the whole live-login surface (list/status/switch/…) operate on the
+// default login without touching every path resolver. A custom (non-cswap)
+// CLAUDE_CONFIG_DIR is left honored (Python parity). Callers skip this for
+// `env`/`run`, which keep their own preset handling.
+func neutralizePinnedSessionProfile(stderr io.Writer) {
+	cfg := os.Getenv("CLAUDE_CONFIG_DIR")
+	if cfg == "" {
+		return
+	}
+	if !sessprofile.IsSessionProfileDir(paths.GetBackupRoot(), cfg) {
+		return
+	}
+	_ = os.Unsetenv("CLAUDE_CONFIG_DIR")
+	io.WriteString(stderr, printer.Dimmed("This shell is pinned via cswap env; operating on the default login.")+"\n")
 }
 
 // isTTY reports whether f is a character device (an interactive terminal).

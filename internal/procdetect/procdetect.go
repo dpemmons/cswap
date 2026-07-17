@@ -80,8 +80,11 @@ func ListSessions(claudeDir string) []ClaudeSession {
 func ListSessionsErr(claudeDir string) ([]ClaudeSession, error) {
 	out := []ClaudeSession{}
 	sessionsDir := filepath.Join(claudeDir, "sessions")
-	info, err := os.Stat(sessionsDir)
-	if err != nil || !info.IsDir() {
+	isDir, err := statDir(sessionsDir)
+	if err != nil {
+		return out, err
+	}
+	if !isDir {
 		return out, nil
 	}
 	matches, err := listDirEntries(sessionsDir, ".json")
@@ -139,8 +142,11 @@ func ListIDEInstances(claudeDir string) []IdeInstance {
 func ListIDEInstancesErr(claudeDir string) ([]IdeInstance, error) {
 	out := []IdeInstance{}
 	ideDir := filepath.Join(claudeDir, "ide")
-	info, err := os.Stat(ideDir)
-	if err != nil || !info.IsDir() {
+	isDir, err := statDir(ideDir)
+	if err != nil {
+		return out, err
+	}
+	if !isDir {
 		return out, nil
 	}
 	matches, err := listDirEntries(ideDir, ".lock")
@@ -204,6 +210,23 @@ func GetRunningInstancesErr(claudeDir string) ([]ClaudeSession, []IdeInstance, e
 		return sessions, ides, err
 	}
 	return sessions, ides, nil
+}
+
+// statDir reports whether path names a directory, mirroring pathlib.Path.is_dir():
+// a stat error whose errno is in the ignore set (ENOENT/ENOTDIR/EBADF/ELOOP — the
+// path simply can't name a directory) yields (false, nil), while any other stat
+// error (EACCES, ...) is surfaced. This is what lets the fail-closed Err variants
+// distinguish "not a directory" (empty result, no error) from "could not look"
+// (error) on an unreadable parent, instead of swallowing every stat failure.
+func statDir(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if ignoreStatError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return info.IsDir(), nil
 }
 
 // listDirEntries returns the sorted full paths of entries in dir whose name

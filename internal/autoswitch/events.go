@@ -12,11 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/jsonout"
+	"git.dpemmons.com/dpemmons/cswap/internal/slotkey"
 )
 
 // pyFloat is a float64 whose JSON form matches Python's json.dumps: a
@@ -443,31 +443,5 @@ func (e ConfigWarningEvent) Human() string {
 // lexicographic for non-numeric slots (deterministic display order; DESIGN
 // concurrency note 9 — Go maps are unordered so the port carries order itself).
 func sortNumeric(nums []string) []string {
-	out := append([]string(nil), nums...)
-	sort.SliceStable(out, func(i, j int) bool { return slotKeyLess(out[i], out[j]) })
-	return out
-}
-
-// slotKeyLess is a total order over slot-key strings: numeric keys sort before
-// non-numeric ones, numerics compare by integer value (equal values tie-break
-// lexicographically for stability), and non-numerics compare lexicographically.
-// A total order is required — a mixed set like "15"/"3"/"2abc" produced an
-// intransitive comparator (3<15, 2abc<3, 15<2abc) under the old
-// numeric-or-lexicographic branch, which sort.Slice may resolve nondeterministically.
-func slotKeyLess(a, b string) bool {
-	na, aok := strconv.Atoi(a)
-	nb, bok := strconv.Atoi(b)
-	switch {
-	case aok == nil && bok == nil:
-		if na != nb {
-			return na < nb
-		}
-		return a < b
-	case aok == nil: // a numeric, b not: numerics first
-		return true
-	case bok == nil: // b numeric, a not: numerics first
-		return false
-	default:
-		return a < b
-	}
+	return slotkey.Sorted(nums)
 }

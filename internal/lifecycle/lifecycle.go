@@ -28,6 +28,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
 	"git.dpemmons.com/dpemmons/cswap/internal/credstore"
@@ -37,9 +39,42 @@ import (
 	"git.dpemmons.com/dpemmons/cswap/internal/usage"
 )
 
+// outputSeam is the permanently-installed, concurrency-safe writer behind
+// Output. Its destination is swapped atomically (see RedirectOutput) so the TUI
+// can silence lifecycle output while a background goroutine writes concurrently,
+// with no data race (FINDING 5). It starts at os.Stdout.
+var outputSeam = newSyncWriter(os.Stdout)
+
 // Output is where human-facing lifecycle messages land (Python's print/warning
-// to stdout). Default os.Stdout; the CLI/tests may redirect it.
-var Output io.Writer = os.Stdout
+// to stdout). Production writers reach the terminal through the atomically-
+// swappable outputSeam; the CLI/tests may replace Output wholesale.
+var Output io.Writer = outputSeam
+
+// syncWriter is an io.Writer whose destination can be swapped atomically. Writes
+// and swaps are safe to interleave across goroutines.
+type syncWriter struct {
+	dst atomic.Pointer[io.Writer]
+}
+
+func newSyncWriter(w io.Writer) *syncWriter {
+	sw := &syncWriter{}
+	sw.dst.Store(&w)
+	return sw
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) { return (*w.dst.Load()).Write(p) }
+
+// swap atomically installs next and returns the previously-installed writer.
+func (w *syncWriter) swap(next io.Writer) io.Writer { return *w.dst.Swap(&next) }
+
+// RedirectOutput atomically points the human-output seam at w and returns a
+// closure that restores the previous destination. Both the redirect and the
+// restore are atomic swaps, so it is safe to call concurrently with goroutines
+// writing to Output.
+func RedirectOutput(w io.Writer) (restore func()) {
+	prev := outputSeam.swap(w)
+	return func() { outputSeam.swap(prev) }
+}
 
 // Prompter is the interactive-prompt seam. The CLI wires a real stdin/stdout
 // implementation; tests inject scripted answers. Prompt returns ok=false on
@@ -106,12 +141,21 @@ func (StdPrompter) Secret(message string) (string, bool) {
 	}
 	restore, err := activeTerminal.disableEcho()
 	if err != nil {
-		// Echo control unavailable: read with echo, like getpass's fallback.
+		// Echo control unavailable despite a terminal: getpass.fallback_getpass
+		// prints this exact warning to the prompt stream, then reads with echo
+		// on (no suppressed-echo newline to restore).
+		fmt.Fprintln(Output, "Warning: Password input may be echoed.")
 		return readLineFallback()
 	}
+	// Echo is now off. Register the restore so cli's SIGINT handler can run it
+	// before os.Exit(130) — a Ctrl-C mid-read exits from the signal goroutine
+	// and never runs the deferred restore below, leaving the terminal with ECHO
+	// off (Python getpass restores termios in a finally on KeyboardInterrupt).
+	id := RegisterCleanup(func() { _ = restore() })
 	// Restore echo and print the newline the suppressed Enter-echo swallowed on
 	// every return path, including read-error/interrupt (getpass finally).
 	defer func() {
+		Unregister(id)
 		_ = restore()
 		fmt.Fprintln(Output)
 	}()
@@ -120,6 +164,56 @@ func (StdPrompter) Secret(message string) (string, bool) {
 		return "", false
 	}
 	return stripInputNewline(line), true
+}
+
+// ---- terminal-cleanup registry -----------------------------------------------
+//
+// Restore closures for in-flight terminal state (echo turned off during a
+// Secret prompt) live here so cli's SIGINT handler can run them before
+// os.Exit(130). Default SIGINT delivery would otherwise exit from the signal
+// goroutine without unwinding Secret's deferred restore, stranding the shell
+// with ECHO off. Python's getpass restores termios in a finally clause that the
+// KeyboardInterrupt still runs; this registry is the Go equivalent for the
+// process-exit path.
+
+var (
+	cleanupMu   sync.Mutex
+	cleanups    = map[uint64]func(){}
+	cleanupNext uint64
+)
+
+// RegisterCleanup records fn and returns a token for Unregister. Threadsafe.
+func RegisterCleanup(fn func()) uint64 {
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	cleanupNext++
+	id := cleanupNext
+	cleanups[id] = fn
+	return id
+}
+
+// Unregister drops the cleanup previously registered under id (no-op if absent,
+// e.g. RunCleanups already fired it). Threadsafe.
+func Unregister(id uint64) {
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	delete(cleanups, id)
+}
+
+// RunCleanups runs every registered cleanup once and clears the registry. cli's
+// SIGINT handler calls this before os.Exit so a Ctrl-C during the no-echo Secret
+// prompt still restores terminal echo. Threadsafe.
+func RunCleanups() {
+	cleanupMu.Lock()
+	fns := make([]func(), 0, len(cleanups))
+	for _, fn := range cleanups {
+		fns = append(fns, fn)
+	}
+	cleanups = map[uint64]func(){}
+	cleanupMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
 }
 
 // readLineFallback reads one line from stdinReader with no echo handling and no

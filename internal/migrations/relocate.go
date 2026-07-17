@@ -9,10 +9,8 @@
 package migrations
 
 import (
-	"sort"
-	"strconv"
-
 	"git.dpemmons.com/dpemmons/cswap/internal/logging"
+	"git.dpemmons.com/dpemmons/cswap/internal/slotkey"
 )
 
 // relocateConfig parameterizes relocate over the two migrations' distinct
@@ -140,23 +138,15 @@ func relocate(cfg relocateConfig) (migrated, failed int) {
 	return migrated, failed
 }
 
-// sortedSlotKeys returns m's keys ordered numerically ascending when every key
-// parses as an integer (the normal case — sequence.json slot numbers), else
-// lexicographically. Processing order has no effect on any account's outcome
-// (email uniqueness is computed up front over the full set); this is purely
-// for deterministic tests and readable logs.
+// sortedSlotKeys returns m's keys in the canonical slot-key total order
+// (numerics first by value, then non-numerics lexicographically). Processing
+// order has no effect on any account's outcome (email uniqueness is computed up
+// front over the full set); this is purely for deterministic tests and readable
+// logs.
 func sortedSlotKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		ni, ierr := strconv.Atoi(keys[i])
-		nj, jerr := strconv.Atoi(keys[j])
-		if ierr == nil && jerr == nil {
-			return ni < nj
-		}
-		return keys[i] < keys[j]
-	})
-	return keys
+	return slotkey.Sorted(keys)
 }

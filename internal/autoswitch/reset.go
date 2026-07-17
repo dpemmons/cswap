@@ -11,6 +11,7 @@ package autoswitch
 
 import (
 	"math"
+	"strconv"
 	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
@@ -123,8 +124,15 @@ func formatRecoveryISO(epoch float64) string {
 	// off the integer seconds first so the round happens on the small
 	// fractional part (full precision), then let time.Unix carry a 1000000µs
 	// round-up into the next second.
+	//
+	// CPython's round() is banker's rounding (round-half-to-even) on the exact
+	// binary value, not half-away-from-zero (math.Round): e.g. 0.0078125*1e6 is
+	// exactly 7812.5 and rounds to 7812, not 7813. Mirror jsonout.round1 —
+	// strconv.FormatFloat with 'f'/prec 0 performs the identical
+	// correctly-rounded, round-half-to-even conversion on the exact value.
 	sec := math.Floor(epoch)
-	us := int64(math.Round((epoch - sec) * 1e6))
+	usRounded, _ := strconv.ParseFloat(strconv.FormatFloat((epoch-sec)*1e6, 'f', 0, 64), 64)
+	us := int64(usRounded)
 	t := time.Unix(int64(sec), us*1000).UTC()
 	if t.Nanosecond() == 0 {
 		return t.Format("2006-01-02T15:04:05") + "Z"

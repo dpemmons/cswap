@@ -113,6 +113,9 @@ func envCommand(prog string, argv []string, s ioStreams) int {
 		return code
 	}
 	setSigintJSON(false)
+	// env's stdout is a pure eval stream; a Ctrl-C cancel note must go to stderr
+	// (never stdout) so it can't corrupt the `eval "$(cswap env)"` (FINDING 9).
+	setSigintCancelToStderr()
 
 	// Account resolution identical to run: explicit NUM|EMAIL|ALIAS, else the
 	// cwd's directory mapping, else error — env has no "default login" fallback
@@ -130,6 +133,14 @@ func envCommand(prog string, argv []string, s ioStreams) int {
 		return 1
 	}
 
+	// D1 (FINDING 1): the requested account is already the active default login
+	// and no CLAUDE_CONFIG_DIR is preset. An unpinned shell already uses it, so
+	// nothing is exported — the informational note SetupEnv wrote to stderr is
+	// the only output.
+	if res.NoOp {
+		return 0
+	}
+
 	emitEnvExport(s.out, shell, res)
 	return 0
 }
@@ -141,7 +152,14 @@ func resolveEnvAccount(sw *core.Switcher, account *string, s ioStreams) (string,
 	if account != nil {
 		return *account, 0, false
 	}
-	cwd, _ := os.Getwd()
+	cwd, werr := os.Getwd()
+	if werr != nil {
+		// Surface the getwd failure as the cause (FINDING 11) rather than probing
+		// a mapping for an empty path, which reports a misleading "no account is
+		// mapped for ''".
+		errorTo(s.err, "Error: could not determine the current directory: "+werr.Error())
+		return "", 1, true
+	}
 	slot, email, rerr := sw.SlotForDirectory(cwd)
 	if rerr != nil {
 		errorTo(s.err, "Error: "+rerr.Error())

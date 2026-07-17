@@ -59,22 +59,41 @@ func (osRunner) Probe(argv, env []string, timeout time.Duration) (string, int, e
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
 	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		return "", 0, ctx.Err() // TimeoutExpired parity → validation fails
+	return classifyProbe(out.String(), err, ctx.Err())
+}
+
+// classifyProbe maps a cmd.Run() result to the (stdout, rc, err) probe contract,
+// mirroring Python's subprocess.run: a TimeoutExpired fires only when the
+// process is actually killed by the deadline, never when the process completed
+// and produced a result. Kept as a pure seam so the classification is
+// unit-testable (see classify-at-deadline coverage in runner_test.go).
+func classifyProbe(out string, runErr error, ctxErr error) (string, int, error) {
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		// The child exited with a successful status but a grandchild held a
+		// captured pipe past the grace window, so WaitDelay force-closed the
+		// pipe. stdout was flushed before the child exited, making the capture
+		// complete and valid — treat it as success with the captured output
+		// rather than a timeout that would delete freshly built profiles.
+		return out, 0, nil
 	}
-	if errors.Is(err, exec.ErrWaitDelay) {
-		// The child exited but a grandchild held a captured pipe past the grace
-		// window; the probe never completed, so treat it as a timeout
-		// (TimeoutExpired parity → validation fails) rather than an OSError.
-		return "", 0, context.DeadlineExceeded
+	if runErr == nil {
+		// Success is honored regardless of ctx state: a probe that completed at
+		// the deadline produced a full result that must not be discarded.
+		return out, 0, nil
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return out.String(), ee.ExitCode(), nil // non-zero rc is not an error
+	if ee, ok := runErr.(*exec.ExitError); ok {
+		// A process the deadline killed dies via signal (never Exited): surface
+		// TimeoutExpired parity → validation fails. A process that exited on its
+		// own — any rc — is honored even if the deadline then fired.
+		if ctxErr == context.DeadlineExceeded && !ee.Exited() {
+			return "", 0, context.DeadlineExceeded
 		}
-		return "", 0, err // OSError parity (could not spawn)
+		return out, ee.ExitCode(), nil // non-zero rc is not an error
 	}
-	return out.String(), 0, nil
+	if ctxErr == context.DeadlineExceeded {
+		return "", 0, context.DeadlineExceeded // killed before start → timeout parity
+	}
+	return "", 0, runErr // OSError parity (could not spawn)
 }
 
 // clockLockConfig acquires Claude Code's <config>.lock via cclock and returns a

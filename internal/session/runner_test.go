@@ -2,19 +2,23 @@ package session
 
 import (
 	"context"
-	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 )
 
-// TestProbeGrandchildHoldingPipe pins the WaitDelay fix: a probe whose child
-// exits immediately but leaves a background grandchild holding the captured
-// stdout pipe must return after the grace window (probeWaitDelay), not after
-// the grandchild's own long sleep, and the abandoned probe classifies as a
-// timeout (TimeoutExpired parity → validation fails), never a stdout capture.
+// TestProbeGrandchildHoldingPipe pins the WaitDelay + ErrWaitDelay fix: a probe
+// whose child exits 0 but leaves a background grandchild holding the captured
+// stdout pipe must return after the grace window (probeWaitDelay), not after the
+// grandchild's own long sleep. ErrWaitDelay is raised only for a successful exit,
+// and the child's stdout was flushed before it exited, so the probe is a SUCCESS
+// with the captured output — not a timeout that would delete a valid profile.
+//
+// This assertion is the inverse of the pre-fix behavior, which mapped
+// ErrWaitDelay to DeadlineExceeded and discarded the captured output.
 func TestProbeGrandchildHoldingPipe(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell probe fixture")
@@ -37,12 +41,33 @@ func TestProbeGrandchildHoldingPipe(t *testing.T) {
 	if elapsed > probeWaitDelay+3*time.Second {
 		t.Fatalf("Probe blocked %v on a held pipe; want return near the %v grace window", elapsed, probeWaitDelay)
 	}
-	// TimeoutExpired parity: non-nil error, empty stdout, rc 0.
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v; want context.DeadlineExceeded (TimeoutExpired parity)", err)
+	// Successful exit with flushed output: nil error, captured stdout, rc 0.
+	if err != nil {
+		t.Fatalf("err = %v; want nil (successful exit, stdout already flushed)", err)
 	}
-	if stdout != "" || rc != 0 {
-		t.Fatalf("stdout=%q rc=%d; want empty/0 on an abandoned probe", stdout, rc)
+	if stdout != "ready\n" || rc != 0 {
+		t.Fatalf("stdout=%q rc=%d; want %q/0 (captured output honored)", stdout, rc, "ready\n")
+	}
+}
+
+// TestClassifyProbeSuccessAtDeadline pins the FINDING 10 fix via the pure
+// classify seam: a probe whose process exited cleanly (runErr == nil) exactly as
+// the deadline fired must be honored as a success with its full captured output,
+// never reclassified as a timeout because ctx has since expired.
+func TestClassifyProbeSuccessAtDeadline(t *testing.T) {
+	stdout, rc, err := classifyProbe("payload", nil, context.DeadlineExceeded)
+	if err != nil || rc != 0 || stdout != "payload" {
+		t.Fatalf("classifyProbe(success-at-deadline) = (%q, %d, %v); want (\"payload\", 0, nil)", stdout, rc, err)
+	}
+}
+
+// TestClassifyProbeErrWaitDelay pins the FINDING 3 fix: ErrWaitDelay (raised only
+// on a successful exit whose pipes stayed open) is a success carrying the
+// captured output, not a timeout.
+func TestClassifyProbeErrWaitDelay(t *testing.T) {
+	stdout, rc, err := classifyProbe("ready\n", exec.ErrWaitDelay, nil)
+	if err != nil || rc != 0 || stdout != "ready\n" {
+		t.Fatalf("classifyProbe(ErrWaitDelay) = (%q, %d, %v); want (%q, 0, nil)", stdout, rc, err, "ready\n")
 	}
 }
 

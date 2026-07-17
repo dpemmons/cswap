@@ -14,13 +14,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
 	"git.dpemmons.com/dpemmons/cswap/internal/credstore"
 	"git.dpemmons.com/dpemmons/cswap/internal/platform"
+	"git.dpemmons.com/dpemmons/cswap/internal/slotkey"
 	"git.dpemmons.com/dpemmons/cswap/internal/version"
 )
 
@@ -253,22 +253,15 @@ func slimConfig(config map[string]any, label string) (map[string]any, error) {
 // already yields exactly these tags.
 func platformTag(p platform.Platform) string { return p.String() }
 
-// sortedSlotKeys returns the account-map keys in ascending numeric order (Python
-// sorted(keys, key=int) for the bulk-export case, spec 07§2.2).
+// sortedSlotKeys returns the account-map keys in the canonical slot-key total
+// order (numerics first by value, then non-numerics lexicographically), matching
+// Python sorted(keys, key=int) for the bulk-export case (spec 07§2.2).
 func sortedSlotKeys(data *SequenceData) []string {
 	keys := make([]string, 0, len(data.Accounts))
 	for k := range data.Accounts {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		ni, ei := strconv.Atoi(keys[i])
-		nj, ej := strconv.Atoi(keys[j])
-		if ei == nil && ej == nil {
-			return ni < nj
-		}
-		return keys[i] < keys[j]
-	})
-	return keys
+	return slotkey.Sorted(keys)
 }
 
 // atomicWriteFile writes content to path atomically with 0600 perms and NO

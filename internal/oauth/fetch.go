@@ -14,17 +14,52 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/logging"
 	"git.dpemmons.com/dpemmons/cswap/internal/printer"
 )
 
+// outputSeam is the permanently-installed, concurrency-safe writer behind
+// Output. Its destination is swapped atomically (see RedirectOutput) so the TUI
+// can redirect the persist-failure warning while the auto-engine goroutine
+// writes it concurrently, with no data race (FINDING 5). It starts at os.Stdout,
+// matching printer.Warning's destination byte-for-byte so non-TUI behaviour is
+// unchanged.
+var outputSeam = newSyncWriter(os.Stdout)
+
 // Output is where the user-visible persist-failure warning lands (04§1.25).
-// It defaults to os.Stdout, matching printer.Warning's destination byte-for-byte
-// so non-TUI behaviour is unchanged. The TUI redirects it to a writer it owns
-// while it holds the alt-screen, so the warning does not corrupt the display.
-var Output io.Writer = os.Stdout
+// Production writers reach the terminal through the atomically-swappable
+// outputSeam; tests may replace Output wholesale for single-threaded capture.
+var Output io.Writer = outputSeam
+
+// syncWriter is an io.Writer whose destination can be swapped atomically. Writes
+// and swaps are safe to interleave across goroutines: a Write always resolves to
+// whichever destination is installed at that instant, and never tears.
+type syncWriter struct {
+	dst atomic.Pointer[io.Writer]
+}
+
+func newSyncWriter(w io.Writer) *syncWriter {
+	sw := &syncWriter{}
+	sw.dst.Store(&w)
+	return sw
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) { return (*w.dst.Load()).Write(p) }
+
+// swap atomically installs next and returns the previously-installed writer.
+func (w *syncWriter) swap(next io.Writer) io.Writer { return *w.dst.Swap(&next) }
+
+// RedirectOutput atomically points the human-output seam at w and returns a
+// closure that restores the previous destination. Both the redirect and the
+// restore are atomic swaps, so it is safe to call concurrently with goroutines
+// writing to Output (e.g. the auto-switch engine's persist-failure warning).
+func RedirectOutput(w io.Writer) (restore func()) {
+	prev := outputSeam.swap(w)
+	return func() { outputSeam.swap(prev) }
+}
 
 // Log is the package logger seam, mirroring Python's module-level
 // logging.getLogger("claude-swap"). When nil, WARNING/DEBUG lines are dropped.

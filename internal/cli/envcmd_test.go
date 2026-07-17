@@ -3,12 +3,47 @@ package cli
 import (
 	"bytes"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/core"
 	"git.dpemmons.com/dpemmons/cswap/internal/session"
 )
+
+// TestEnvGetwdErrorSurfaced: FINDING 11. When os.Getwd fails (the process cwd was
+// removed) and no account was passed, env surfaces the getwd error as the cause
+// rather than probing a mapping for an empty path.
+func TestEnvGetwdErrorSurfaced(t *testing.T) {
+	cleanHome(t)
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Skipf("cannot read cwd: %v", err)
+	}
+	gone := t.TempDir()
+	if err := os.Chdir(gone); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Remove(gone); err != nil {
+		t.Skipf("could not remove cwd to force getwd failure: %v", err)
+	}
+	if _, err := os.Getwd(); err == nil {
+		t.Skip("os.Getwd still succeeds after removing cwd on this platform")
+	}
+
+	code, out, errStr := runSub(t, "env")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stderr=%q)", code, errStr)
+	}
+	if !strings.Contains(errStr, "could not determine the current directory") {
+		t.Errorf("stderr = %q, want the getwd cause surfaced", errStr)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty", out)
+	}
+}
 
 // TestEnvPreDispatchRegistered: `env` is pre-dispatched (like run/map/alias),
 // not routed through memorable-verb translation. --help returns 0 with the
@@ -177,17 +212,47 @@ func TestEnvNoticesLandOnStderr(t *testing.T) {
 
 // fakeEnvPreparer records the identifier and writes a notice to its sink (the
 // stderr writer env hands it), returning a canned result with one scrubbed var.
+// When noOp is set it returns a D1 no-op result instead (nothing to export).
 type fakeEnvPreparer struct {
 	sink       io.Writer
 	identifier string
+	noOp       bool
 }
 
 func (f *fakeEnvPreparer) SetupEnv(identifier string, _, _ bool) (session.EnvResult, error) {
 	f.identifier = identifier
+	if f.noOp {
+		// The D1 note the real Manager writes to its Stdout sink before no-oping.
+		io.WriteString(f.sink, "Account-2 (user@example.com) is the active default login — an unpinned shell already uses it; nothing exported.\n")
+		return session.EnvResult{AccountNum: "2", Email: "user@example.com", NoOp: true}, nil
+	}
 	// A notice, exactly as the real Manager would emit to its Stdout sink.
 	io.WriteString(f.sink, "Prepared Account-2 (user@example.com) [session mode]\n")
 	return session.EnvResult{
 		Dir:      "/prep/2-me",
 		Scrubbed: []string{"ANTHROPIC_API_KEY"},
 	}, nil
+}
+
+// TestEnvNoOpEmitsNothingOnStdout: D1 (FINDING 1). When SetupEnv returns a NoOp
+// result (requested account is already the active default login, no preset),
+// `cswap env` exits 0 and writes NOTHING to stdout — the note landed on stderr.
+func TestEnvNoOpEmitsNothingOnStdout(t *testing.T) {
+	cleanHome(t)
+	prev := newEnvPreparer
+	newEnvPreparer = func(_ *core.Switcher, sink io.Writer) envPreparer {
+		return &fakeEnvPreparer{sink: sink, noOp: true}
+	}
+	t.Cleanup(func() { newEnvPreparer = prev })
+
+	code, out, errStr := runSub(t, "env", "2")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr=%q)", code, errStr)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty (D1 exports nothing)", out)
+	}
+	if !strings.Contains(errStr, "nothing exported") {
+		t.Errorf("D1 note did not reach stderr: %q", errStr)
+	}
 }
