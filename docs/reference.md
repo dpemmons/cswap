@@ -1199,6 +1199,12 @@ form intended for cron. Switching proactively (while the old account is still
 valid) is what keeps the change safe under the macOS Keychain propagation
 latency.
 
+Which accounts qualify as targets is governed by the threshold, hysteresis,
+cooldown, and quarantine rules; the order in which qualifying targets are
+tried is governed by `autoswitch.strategy` — most headroom first (`best`,
+the default) or earliest weekly renewal first (`soonest-reset`). See
+[SETTINGS](#settings) for the ordering rules.
+
 ### Files
 
 Reads `sequence.json`, `settings.json`, `cache/usage.json`. Reads and writes

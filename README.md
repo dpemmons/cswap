@@ -44,7 +44,9 @@ backup store and the active login; it removes nothing.
 weekly windows. cswap fetches each account's usage and reports the remaining
 headroom as a percentage. An account is *at limit* when a relevant window has
 reached or exceeded its limit. Auto-switch and the `best` switch strategy use
-this headroom to choose a target.
+this headroom to choose a target; setting `autoswitch.strategy` to
+`soonest-reset` makes auto-switch order targets by earliest weekly renewal
+instead.
 
 **Session profile.** A session profile is a private `CLAUDE_CONFIG_DIR` under
 the backup store's `sessions/` directory. It lets one account run in a single
@@ -324,6 +326,20 @@ account's scoped weekly window. An exhausted per-model weekly window then reads
 as at-limit even when the account-wide 7-day window has headroom. A name that
 matches no window is a silent no-op — use the display name exactly as it appears
 in the account's per-model usage rows.
+
+**Renewal-ordered switching.** By default auto-switch tries the qualifying
+target with the most headroom first (`autoswitch.strategy best`). Setting the
+strategy to `soonest-reset` orders qualifying targets by weekly renewal
+instead: the account whose 7-day window — and any `autoswitch.model` weekly
+windows — refills earliest is tried first, so quota is spent where it returns
+soonest. Which accounts qualify does not change: a target must still be under
+the threshold and beat the active account by the hysteresis margin under
+either strategy.
+
+```
+$ cswap config set autoswitch.strategy soonest-reset
+autoswitch.strategy = soonest-reset
+```
 
 ### Run accounts in parallel
 
