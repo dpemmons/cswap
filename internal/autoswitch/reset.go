@@ -40,6 +40,13 @@ func bindingPct(value map[string]any, models []string) *float64 {
 	return &v
 }
 
+// renewalTS is the account's weekly-scope renewal epoch (latest parseable
+// weekly reset among the 7d + matched scoped windows), or nil when unknown, via
+// the oauth projection. Go-side extension (DESIGN A17).
+func renewalTS(value map[string]any, models []string) *float64 {
+	return oauth.RenewalTS(oauth.NewUsage(value), models)
+}
+
 // windowPcts returns the ordered "5h","7d",scoped label→pct windows the
 // decision reads (05§9 _window_pcts).
 func windowPcts(value map[string]any, models []string) []WindowPct {

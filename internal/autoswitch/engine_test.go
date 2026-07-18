@@ -473,6 +473,76 @@ func TestModelMaxedSwitchesDespiteSessionHeadroom(t *testing.T) {
 	}
 }
 
+// -- soonest-reset strategy: renewal-ordered target selection (DESIGN A17) ----
+
+// threeCandidatesForStrategy wires current="1" (proactive, headroom 5) plus two
+// oauth candidates 2 and 3, both qualifying, whose 7d windows carry the given
+// pcts/resets so a strategy can be exercised on their headroom vs weekly reset.
+func threeCandidatesForStrategy(pct2 float64, reset2 string, pct3 float64, reset3 string) *fakeSwitcher {
+	f := newFake()
+	f.current = strp("1")
+	f.switchable = []string{"1", "2", "3"}
+	f.emails = map[string]string{"1": "a", "2": "b", "3": "c"}
+	f.entries = map[string]usage.UsageEntry{
+		"1": dictEntry(usageOf(95, 0)), // active over threshold -> proactive
+		"2": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(pct2, reset2)}),
+		"3": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(pct3, reset3)}),
+	}
+	return f
+}
+
+// TestStrategyOrdersQualifyingCandidates fixes that only the ordering of the
+// already-qualified slice differs by strategy: "best" takes the most headroom;
+// "soonest-reset" takes the earliest weekly renewal even from a lower-headroom
+// candidate. Both accounts qualify identically (below threshold, past the
+// hysteresis margin); the pick is asserted via the dry-run switch target.
+func TestStrategyOrdersQualifyingCandidates(t *testing.T) {
+	cases := []struct {
+		strategy string
+		want     int
+	}{
+		{"best", 2},          // candidate 2 has the most headroom (7d 10% -> h 90)
+		{"soonest-reset", 3}, // candidate 3 renews earlier (07-19 < 07-20) despite h 60
+	}
+	for _, c := range cases {
+		t.Run(c.strategy, func(t *testing.T) {
+			clk := newClk()
+			f := threeCandidatesForStrategy(10, "2026-07-20T00:00:00Z", 40, "2026-07-19T00:00:00Z")
+			s := settings.Default()
+			s.Strategy = c.strategy
+			rec := &recorder{}
+			e := build(t, f, s, rec, clk, true) // dry-run: decide only, no freshen
+			if got := e.Tick(); got != Switched {
+				t.Fatalf("outcome = %v, want Switched (kinds=%v)", got, rec.kinds())
+			}
+			sw := rec.last("switch").(SwitchEvent)
+			if n := sw.ToRef["number"]; n != c.want {
+				t.Errorf("target = %v, want %d", n, c.want)
+			}
+		})
+	}
+}
+
+// TestSoonestResetKnownRenewalBeatsUnknown checks the tier rule: a candidate
+// with a known weekly renewal is preferred over one with unknown renewal even
+// when the unknown-renewal candidate has strictly more headroom.
+func TestSoonestResetKnownRenewalBeatsUnknown(t *testing.T) {
+	clk := newClk()
+	// 2: h 60 with a known 7d reset; 3: h 90 but no weekly reset (unknown renewal).
+	f := threeCandidatesForStrategy(40, "2026-07-19T00:00:00Z", 10, "")
+	s := settings.Default()
+	s.Strategy = "soonest-reset"
+	rec := &recorder{}
+	e := build(t, f, s, rec, clk, true)
+	if got := e.Tick(); got != Switched {
+		t.Fatalf("outcome = %v, want Switched (kinds=%v)", got, rec.kinds())
+	}
+	sw := rec.last("switch").(SwitchEvent)
+	if n := sw.ToRef["number"]; n != 2 {
+		t.Errorf("target = %v, want 2 (known renewal beats unknown despite less headroom)", n)
+	}
+}
+
 // -- item 18/19: idle-hold -------------------------------------------------
 
 func TestIdleHold(t *testing.T) {

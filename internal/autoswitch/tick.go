@@ -160,7 +160,7 @@ func (e *Engine) tickInner() (TickOutcome, error) {
 		return NoAction, nil
 	}
 
-	ordered, oauthCandidates, apiKeyCandidates, anyKnown, blk := e.selectCandidates(cur, quarantined, s, trigger, activeHeadroom, headroom)
+	ordered, oauthCandidates, apiKeyCandidates, anyKnown, blk := e.selectCandidates(cur, quarantined, s, trigger, activeHeadroom, headroom, usageMap)
 	if blk != nil {
 		return *blk, nil
 	}
@@ -237,9 +237,13 @@ func (e *Engine) tickInner() (TickOutcome, error) {
 // (05§10). It returns the ordered oauth targets (or the api-key last resort),
 // the oauth/api-key candidate splits, whether any oauth candidate had readable
 // usage, and a non-nil BLOCKED outcome for the no-candidates early return.
+// usageMap supplies the per-account decision values the soonest-reset strategy
+// needs to compute each candidate's weekly renewal; the qualification gates are
+// identical for every strategy — only the final ordering of the qualifying
+// slice varies (Go-side extension, DESIGN A17).
 func (e *Engine) selectCandidates(
 	cur string, quarantined map[string]bool, s settings.AutoSwitchSettings, trigger string,
-	activeHeadroom *float64, headroom map[string]*float64,
+	activeHeadroom *float64, headroom map[string]*float64, usageMap map[string]any,
 ) (ordered, oauthCandidates, apiKeyCandidates []string, anyKnown bool, blk *TickOutcome) {
 	var candidates []string
 	for _, num := range e.sw.SwitchableAccountNumbers() {
@@ -261,10 +265,6 @@ func (e *Engine) selectCandidates(
 		return nil, oauthCandidates, apiKeyCandidates, false, &b
 	}
 
-	type qual struct {
-		h   float64
-		num string
-	}
 	var qualifying []qual
 	for _, num := range oauthCandidates {
 		h := headroom[num]
@@ -284,10 +284,9 @@ func (e *Engine) selectCandidates(
 				continue
 			}
 		}
-		qualifying = append(qualifying, qual{*h, num})
+		qualifying = append(qualifying, qual{h: *h, renewal: renewalTS(usageDict(usageMap[num]), e.models), num: num})
 	}
-	// Best headroom first; stable sort preserves sequence order for ties.
-	sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].h > qualifying[j].h })
+	sortQualifying(qualifying, s.Strategy)
 	for _, q := range qualifying {
 		ordered = append(ordered, q.num)
 	}
@@ -295,6 +294,38 @@ func (e *Engine) selectCandidates(
 		ordered = apiKeyCandidates // last resort (unmeasurable headroom)
 	}
 	return ordered, oauthCandidates, apiKeyCandidates, anyKnown, nil
+}
+
+// qual is one qualifying oauth target: its headroom, its weekly renewal epoch
+// (nil = unknown), and its account number. The slice is built in switchable
+// (sequence) order, so a stable sort resolves every ordering tie by sequence.
+type qual struct {
+	h       float64
+	renewal *float64
+	num     string
+}
+
+// sortQualifying orders the qualifying targets per autoswitch.strategy. "best"
+// is headroom descending (byte-identical to the original single stable sort:
+// ties keep sequence order). "soonest-reset" ranks candidates with a known
+// weekly renewal ahead of those without, earliest renewal first, then falls
+// back to headroom descending, then to sequence order (Go-side extension,
+// DESIGN A17).
+func sortQualifying(qualifying []qual, strategy string) {
+	if strategy == "soonest-reset" {
+		sort.SliceStable(qualifying, func(i, j int) bool {
+			a, b := qualifying[i], qualifying[j]
+			if (a.renewal != nil) != (b.renewal != nil) {
+				return a.renewal != nil // known renewal sorts before unknown
+			}
+			if a.renewal != nil && b.renewal != nil && *a.renewal != *b.renewal {
+				return *a.renewal < *b.renewal // earliest weekly renewal first
+			}
+			return a.h > b.h // equal/both-unknown renewal → most headroom first
+		})
+		return
+	}
+	sort.SliceStable(qualifying, func(i, j int) bool { return qualifying[i].h > qualifying[j].h })
 }
 
 // perform runs (or, in dry-run, reports) the switch decision (05§12).

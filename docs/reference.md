@@ -1929,7 +1929,7 @@ Every key, with its type, range, default, and meaning:
 | `autoswitch.intervalSeconds` | float (seconds) | 15–3600 | 60 | Poll interval for the `cswap auto` loop. |
 | `autoswitch.cooldownSeconds` | float (seconds) | 0–86400 | 300 | Minimum seconds between proactive switches. |
 | `autoswitch.hysteresisPct` | float (percent) | 0–50 | 10 | A switch target must beat the active account by at least this many percent. |
-| `autoswitch.strategy` | choice | `best` | `best` | How auto-switch picks the target account. `best` is the only accepted value for this setting. |
+| `autoswitch.strategy` | choice | `best`, `soonest-reset` | `best` | How auto-switch orders qualifying targets: `best` (most headroom) or `soonest-reset` (earliest weekly renewal). See below. |
 | `autoswitch.includeApiKeyAccounts` | bool | — | false | Allow rotating onto managed API-key accounts (billed per token). |
 | `autoswitch.unhealthyTicks` | int | 1–100 | 3 | Consecutive failed polls before an account is treated as unhealthy. |
 | `autoswitch.model` | string | — | (none) | Also switch on these models' weekly limits (for example `Fable`, `Fable,Opus`, or `all`). |
@@ -1940,13 +1940,39 @@ are strict: an out-of-range or mistyped value is rejected with a `ConfigError`.
 A whole-number float is stored and shown without a fractional part
 (`80.0` → `80`).
 
+**`autoswitch.strategy` ordering.** The strategy governs only the order in
+which already-qualifying candidates are offered to `cswap auto`; it changes
+none of the qualification gates — known and positive headroom, the proactive
+threshold-landing and hysteresis checks, the cooldown, quarantine exclusion,
+and the API-key last resort — which apply identically under both values and
+for every trigger (`proactive`, `at-limit`, `failover`).
+
+- `best` orders candidates by headroom, most remaining first; accounts tied
+  on headroom keep sequence order. This is the setting's default.
+- `soonest-reset` orders candidates by *renewal time*: the latest parseable
+  `resets_at` among the account's weekly-scope windows — the 7-day window
+  plus every per-model scoped window matched by `autoswitch.model`. The 5h
+  window is never part of the renewal, since it is not weekly. A window
+  whose `resets_at` is absent or unparseable is skipped; an account with no
+  parseable weekly `resets_at` at all has an *unknown* renewal. Candidates
+  with a known renewal sort before every candidate with an unknown renewal;
+  among known renewals the earliest sorts first. Ties — an equal renewal, or
+  two unknown renewals — fall back to headroom descending, then to sequence
+  order.
+
+```
+$ cswap config set autoswitch.strategy soonest-reset
+autoswitch.strategy = soonest-reset
+```
+
 **`autoswitch.model` name matching.** A model name is matched against the
 scoped weekly window's display name, compared case-insensitively and exactly.
 The value stored and matched is the bare display name (for example `Fable`), not
 a decorated form; a name that matches no window is silently inert (no window is
 counted and no error is raised). The `--strategy` command-line flag and the
-usage-aware `switch`/`auto` strategies accept `best` and `next-available`; the
-persisted `autoswitch.strategy` setting accepts only `best`.
+usage-aware `switch`/`auto` strategies accept `best` and `next-available` — a
+separate vocabulary from the persisted `autoswitch.strategy` setting, which
+accepts `best` and `soonest-reset`.
 
 ## EXIT STATUS
 

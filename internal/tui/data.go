@@ -91,6 +91,15 @@ func bindingPct(lastGood map[string]any, models []string) *float64 {
 	return &pct
 }
 
+// renewalTS returns the account's weekly-scope renewal epoch (the latest
+// parseable weekly reset among the 7d + matched scoped windows), or nil when
+// unknown, on the same oauth projection/model axis bindingPct uses so the
+// soonest-reset ranking never disagrees with the engine's pick. Go-side
+// extension (DESIGN A17).
+func renewalTS(lastGood map[string]any, models []string) *float64 {
+	return oauth.RenewalTS(oauth.NewUsage(lastGood), models)
+}
+
 // resetText renders the live countdown to a window's reset ("resets 2h 13m"),
 // "resets now" when elapsed, or "" when unknown (09§6.3 reset_text). now is
 // fractional Unix seconds.

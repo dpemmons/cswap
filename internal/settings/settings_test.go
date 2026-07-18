@@ -281,6 +281,28 @@ func TestSetSetting_RejectsOutOfRangeWithoutWriting(t *testing.T) {
 	}
 }
 
+// TestSetSetting_StrategyChoices locks the two accepted autoswitch.strategy
+// values ("best" and the added "soonest-reset") and that an off-list value is
+// still strictly rejected with the choice list (the lenient-load fallback for a
+// bad value is covered by TestLoad_ClampTable's strategy_chaos case).
+func TestSetSetting_StrategyChoices(t *testing.T) {
+	root := t.TempDir()
+	v, err := SetSetting(root, "autoswitch.strategy", "soonest-reset")
+	if err != nil || v != "soonest-reset" {
+		t.Fatalf("v=%v err=%v, want soonest-reset, nil", v, err)
+	}
+	if got := Load(root).Strategy; got != "soonest-reset" {
+		t.Errorf("Load().Strategy = %q, want soonest-reset", got)
+	}
+	if _, err := SetSetting(root, "autoswitch.strategy", "best"); err != nil {
+		t.Errorf("best rejected: %v", err)
+	}
+	_, err = SetSetting(root, "autoswitch.strategy", "chaos")
+	if err == nil || !strings.Contains(err.Error(), "soonest-reset") {
+		t.Errorf("err = %v, want it to list the valid choices including soonest-reset", err)
+	}
+}
+
 func TestSetSetting_RejectsUnknownKey(t *testing.T) {
 	root := t.TempDir()
 	_, err := SetSetting(root, "autoswitch.bogus", "1")

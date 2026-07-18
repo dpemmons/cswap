@@ -988,3 +988,55 @@ switching accounts or a credential change they re-run the `eval` or use
 `cswap run` (which re-prepares on every launch). Claude Code's live-session
 guards keep working because it writes its session files inside the profile
 directory the export points at.
+
+## A17. `autoswitch.strategy: soonest-reset` — renewal-ordered candidates (Go-side additive extension)
+
+`autoswitch.strategy` (`internal/settings/settings.go` `SettingSpecs`, kind
+`KindChoice`) gains a second choice, `soonest-reset`, alongside the existing
+`best`. Default stays `best`; an invalid persisted value still falls back to
+the default via the existing `KindChoice` clamp — no new fallback path. It is
+a deliberate Go-side extension with no Python counterpart: Python's auto-switch
+has no ranking axis beyond most-headroom, so this adds a second one without
+touching the Python-fidelity contract in `docs/port-spec/`.
+
+**Ordering only.** `internal/autoswitch/tick.go` `selectCandidates` changes
+exactly the sort of the already-built `qualifying` slice. Every qualification
+gate — `headroom != nil && > 0`, the proactive threshold-landing and
+hysteresis checks, cooldown, quarantine, and the API-key last resort — is
+IDENTICAL for both strategies and all three triggers (`proactive`, `at-limit`,
+`failover`). `best` stays byte-identical to today: headroom descending,
+`sort.SliceStable` so ties keep sequence order. `soonest-reset` sorts known
+renewal before unknown, known renewal ascending, then falls back to headroom
+descending and finally to sequence order (via `sort.SliceStable` over the
+sequence-ordered list) for remaining ties. Engine events are UNCHANGED —
+no new fields, `Poll`/`Switch`/`NoSwitch` stay byte-stable; the strategy is
+observable only through which account gets picked.
+
+**`oauth.RenewalTS` projection.** `internal/oauth/windows.go` gets one new
+exported function, `RenewalTS(u *Usage, models []string) *float64`, returning
+an account's renewal as epoch seconds: the LATEST parseable `resets_at` among
+`RelevantWindows(u, models)` restricted to weekly-scope windows — the `7d`
+window plus every scoped per-model window `autoswitch.model` matches — with
+the `5h` window excluded (it is not weekly). An entry with an absent or
+unparseable `resets_at` is skipped; if no weekly window has a parseable
+`resets_at`, the result is `nil` (unknown). Parsing reuses the accepted
+layouts from `autoswitch/reset.go`'s private `parseResetTS`
+(`time.RFC3339Nano` then `time.RFC3339`, empty → `nil`) via a small unexported
+helper local to `oauth` — `autoswitch`'s `parseResetTS` stays unexported;
+`oauth.RenewalTS` is the one shared, exported entry point and both
+`autoswitch` and `tui` call it. `selectCandidates` threads the engine's
+per-account usage (the `usageMap` built in `tickInner`) alongside the existing
+headroom map so it can compute renewal per candidate.
+
+**TUI visibility (`internal/tui/autoview.go`).** `summaryText` appends
+` · soonest-reset` (plain segment, after the `poll every Ns` segment) only
+when `a.settings.Strategy != "best"`. `candidatesText` computes
+`oauth.RenewalTS` from `acc.Usage.LastGood` via `oauth.NewUsage` (mirroring how
+it already derives `bindingPct`) and, only under `soonest-reset`, ranks by
+composite tier instead of plain pct: tier 0 (has headroom, known renewal) by
+renewal ascending; tier 1 (has headroom, unknown renewal) by pct ascending;
+tier 2 (at/over limit) by renewal ascending with unknown renewal last in the
+tier, then pct ascending; tier 3 the existing sentinel (today key `998`); tier
+4 the existing usage-unknown case (`999`). Ties at every tier resolve by
+account number ascending, same as today. Under `best` the panel's ranking is
+untouched.

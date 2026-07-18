@@ -311,13 +311,23 @@ func (a *autoScreen) endAdjust(m *Model) {
 
 // -- candidates (09§4.7) -----------------------------------------------------
 
+// candidateRank carries both ranking keys so the panel can order candidates by
+// either strategy from the same pass. "best" compares bestKey (binding pct, or
+// the 998 sentinel / 999 usage-unknown sort keys) then account number.
+// "soonest-reset" compares tier (0 headroom+known renewal, 1 headroom+unknown
+// renewal, 2 at/over limit, 3 sentinel, 4 usage-unknown), then renewal/pct
+// within the tier, then account number (Go-side extension, DESIGN A17).
 type candidateRank struct {
-	key    float64
-	number string
+	number  string
+	bestKey float64  // "best"-mode key: binding pct | 998 sentinel | 999 unknown
+	tier    int      // "soonest-reset" tier 0..4
+	pct     float64  // binding pct (within-tier tiebreak; 0 when not applicable)
+	renewal *float64 // weekly renewal epoch (tiers 0/2; nil = unknown)
 }
 
-// candidatesText ranks switch targets by remaining headroom, best first, on the
-// same model axis the engine uses (09§4.7).
+// candidatesText ranks switch targets on the same model axis the engine decides
+// with (09§4.7): remaining headroom for "best", or the tiered soonest-weekly-
+// renewal order for "soonest-reset" (Go-side extension, DESIGN A17).
 func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	models := settings.ParseModelNames(a.settings.Model)
 	var ranked []candidateRank
@@ -333,13 +343,23 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 		switch {
 		case acc.Usage.Sentinel != "":
 			entry.addFg("  "+sentinelLabel(acc.Usage.Sentinel), colMuted)
-			ranked = append(ranked, candidateRank{998.0, acc.Number})
+			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 998.0, tier: 3})
 		case pct == nil:
 			entry.addFg("  usage unknown", colMuted)
-			ranked = append(ranked, candidateRank{999.0, acc.Number})
+			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 4})
 		default:
 			entry.add(fmt.Sprintf("  %3.0f%% used", *pct), segStyle{Fg: severityColorF(*pct)})
-			ranked = append(ranked, candidateRank{*pct, acc.Number})
+			r := candidateRank{number: acc.Number, bestKey: *pct, pct: *pct,
+				renewal: renewalTS(acc.Usage.LastGood, models)}
+			switch {
+			case *pct >= 100.0:
+				r.tier = 2 // at/over limit
+			case r.renewal != nil:
+				r.tier = 0 // headroom + known renewal
+			default:
+				r.tier = 1 // headroom, unknown renewal
+			}
+			ranked = append(ranked, r)
 		}
 		lines[acc.Number] = entry
 	}
@@ -350,16 +370,54 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 		out.addFg("\n  no other switchable accounts", colMuted)
 		return out
 	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].key != ranked[j].key {
-			return ranked[i].key < ranked[j].key
-		}
-		return ranked[i].number < ranked[j].number
-	})
+	less := candidateLessBest
+	if a.settings.Strategy == "soonest-reset" {
+		less = candidateLessSoonest
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return less(ranked[i], ranked[j]) })
 	for _, r := range ranked {
 		out.addText(lines[r.number])
 	}
 	return out
+}
+
+// candidateLessBest is the "best" panel order: binding pct ascending (sentinel
+// 998, usage-unknown 999 sort last), ties by account number ascending.
+func candidateLessBest(a, b candidateRank) bool {
+	if a.bestKey != b.bestKey {
+		return a.bestKey < b.bestKey
+	}
+	return a.number < b.number
+}
+
+// candidateLessSoonest is the "soonest-reset" panel order: by tier, then within
+// the tier by earliest weekly renewal (tiers 0/2, unknown renewal last in tier
+// 2) or lowest pct (tier 1, and as the tier-2 tiebreak), then account number.
+func candidateLessSoonest(a, b candidateRank) bool {
+	if a.tier != b.tier {
+		return a.tier < b.tier
+	}
+	switch a.tier {
+	case 0: // both have a known renewal
+		if *a.renewal != *b.renewal {
+			return *a.renewal < *b.renewal
+		}
+	case 1: // both unknown renewal
+		if a.pct != b.pct {
+			return a.pct < b.pct
+		}
+	case 2: // at/over limit: known renewal first, then renewal asc, then pct asc
+		if (a.renewal != nil) != (b.renewal != nil) {
+			return a.renewal != nil
+		}
+		if a.renewal != nil && b.renewal != nil && *a.renewal != *b.renewal {
+			return *a.renewal < *b.renewal
+		}
+		if a.pct != b.pct {
+			return a.pct < b.pct
+		}
+	}
+	return a.number < b.number
 }
 
 // footerBindings are the Auto screen's footer-visible bindings (09§4.1): l
@@ -460,6 +518,9 @@ func (a *autoScreen) summaryText() richText {
 		t.addFg(" (session)", colMuted)
 	}
 	t.addPlain(fmt.Sprintf(" · poll every %.0fs", a.settings.IntervalSeconds))
+	if a.settings.Strategy != "best" {
+		t.addPlain(" · soonest-reset")
+	}
 	if a.adjusting {
 		t.addFg("   ← → adjust · enter done", colMuted)
 	}

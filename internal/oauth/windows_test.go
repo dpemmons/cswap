@@ -3,7 +3,10 @@
 
 package oauth
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func headroomVal(t *testing.T, p *float64) float64 {
 	t.Helper()
@@ -113,6 +116,97 @@ func TestAccountHeadroomUnknown(t *testing.T) {
 	}
 	if got := AccountHeadroom(NewUsage(map[string]any{}), nil); got != nil {
 		t.Errorf("empty usage headroom = %v, want nil", *got)
+	}
+}
+
+// mustEpoch parses an RFC3339 Z timestamp to epoch seconds, matching RenewalTS's
+// UnixNano/1e9 conversion so expectations compare exactly.
+func mustEpoch(t *testing.T, iso string) float64 {
+	t.Helper()
+	tm, err := time.Parse(time.RFC3339, iso)
+	if err != nil {
+		t.Fatalf("parse %q: %v", iso, err)
+	}
+	return float64(tm.UnixNano()) / 1e9
+}
+
+// TestRenewalTS covers the weekly-renewal definition (DESIGN A17): the latest
+// parseable resets_at among the weekly-scope windows (7d + matched scoped),
+// with the 5h window always excluded and absent/unparseable resets skipped.
+func TestRenewalTS(t *testing.T) {
+	cases := []struct {
+		name   string
+		norm   map[string]any
+		models []string
+		want   string // expected ISO reset; "" => nil
+	}{
+		{
+			name: "latest_weekly_wins_5h_excluded",
+			norm: map[string]any{
+				// 5h resets latest of all, but is never a weekly window.
+				"five_hour": map[string]any{"pct": 10.0, "resets_at": "2026-07-10T00:00:00Z"},
+				"seven_day": map[string]any{"pct": 20.0, "resets_at": "2026-07-05T19:00:00Z"},
+				"scoped":    []any{map[string]any{"name": "Fable", "pct": 30.0, "resets_at": "2026-07-06T12:00:00Z"}},
+			},
+			models: []string{"Fable"},
+			want:   "2026-07-06T12:00:00Z", // latest of 7d and Fable
+		},
+		{
+			name: "scoped_ignored_without_model",
+			norm: map[string]any{
+				"seven_day": map[string]any{"pct": 20.0, "resets_at": "2026-07-05T19:00:00Z"},
+				"scoped":    []any{map[string]any{"name": "Fable", "pct": 30.0, "resets_at": "2026-07-09T00:00:00Z"}},
+			},
+			models: nil,
+			want:   "2026-07-05T19:00:00Z", // only 7d is weekly-relevant
+		},
+		{
+			name: "scoped_counts_when_matched",
+			norm: map[string]any{
+				"seven_day": map[string]any{"pct": 20.0, "resets_at": "2026-07-05T19:00:00Z"},
+				"scoped":    []any{map[string]any{"name": "Fable", "pct": 30.0, "resets_at": "2026-07-09T00:00:00Z"}},
+			},
+			models: []string{"fable"}, // case-insensitive
+			want:   "2026-07-09T00:00:00Z",
+		},
+		{
+			name: "unparseable_and_absent_skipped_to_parseable",
+			norm: map[string]any{
+				"seven_day": map[string]any{"pct": 20.0, "resets_at": "2026-07-05T19:00:00Z"},
+				"scoped":    []any{map[string]any{"name": "Fable", "pct": 30.0, "resets_at": "garbage"}},
+			},
+			models: []string{"Fable"},
+			want:   "2026-07-05T19:00:00Z", // the bad Fable reset is skipped, not fatal
+		},
+		{
+			name: "no_parseable_weekly_reset_is_nil",
+			norm: map[string]any{
+				"five_hour": map[string]any{"pct": 10.0, "resets_at": "2026-07-10T00:00:00Z"}, // excluded
+				"seven_day": map[string]any{"pct": 20.0},                                      // no resets_at
+			},
+			models: nil,
+			want:   "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RenewalTS(NewUsage(c.norm), c.models)
+			if c.want == "" {
+				if got != nil {
+					t.Fatalf("RenewalTS = %v, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != mustEpoch(t, c.want) {
+				t.Fatalf("RenewalTS = %v, want %s", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRenewalTSNilUsage(t *testing.T) {
+	if got := RenewalTS(nil, nil); got != nil {
+		t.Errorf("RenewalTS(nil) = %v, want nil", *got)
 	}
 }
 

@@ -8,7 +8,10 @@
 
 package oauth
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Window is a projected 5h/7d (or scoped) usage window.
 type Window struct {
@@ -171,4 +174,40 @@ func AccountHeadroom(u *Usage, models []string) *float64 {
 	}
 	h := 100.0 - max
 	return &h
+}
+
+// RenewalTS returns the account's weekly-scope renewal time in epoch seconds:
+// the LATEST parseable resets_at among the weekly-scope relevant windows — the
+// 7d window plus every scoped per-model window matched by models, i.e. every
+// RelevantWindows entry except the one labeled "5h". Absent/unparseable
+// resets_at entries are skipped; nil when no weekly-scope window carries a
+// parseable reset (and nil for nil usage). Go-side extension (DESIGN A17).
+func RenewalTS(u *Usage, models []string) *float64 {
+	var latest *float64
+	for _, w := range RelevantWindows(u, models) {
+		if w.Label == "5h" {
+			continue
+		}
+		ts := parseRenewalTS(w.ResetsAt)
+		if ts != nil && (latest == nil || *ts > *latest) {
+			latest = ts
+		}
+	}
+	return latest
+}
+
+// parseRenewalTS parses an ISO-8601 reset timestamp to epoch seconds, or nil for
+// an empty/unparseable value. Accepts RFC3339Nano then RFC3339 (Z or +00:00),
+// the same layouts autoswitch's parseResetTS accepts.
+func parseRenewalTS(resetsAt string) *float64 {
+	if resetsAt == "" {
+		return nil
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, resetsAt); err == nil {
+			v := float64(t.UnixNano()) / 1e9
+			return &v
+		}
+	}
+	return nil
 }
