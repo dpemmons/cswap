@@ -125,7 +125,7 @@ func (a *autoScreen) update(m *Model, msg tea.Msg) tea.Cmd {
 			a.endAdjust(m)
 		}
 		return nil
-	case "escape", "q":
+	case "esc", "q":
 		return a.back(m)
 	}
 	return nil

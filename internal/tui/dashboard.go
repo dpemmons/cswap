@@ -133,7 +133,7 @@ func (d *dashboardScreen) update(m *Model, msg tea.Msg) tea.Cmd {
 		return d.openSwitch(m)
 	case "w":
 		return m.openWatch()
-	case "escape", "left":
+	case "esc", "left":
 		d.popMenu()
 		return nil
 	case "q":
@@ -525,7 +525,7 @@ func (s *switchScreen) update(m *Model, msg tea.Msg) tea.Cmd {
 		return s.selectHighlighted(m)
 	case "b":
 		return m.switchBest()
-	case "escape", "q", "s":
+	case "esc", "q", "s":
 		return m.popScreen()
 	case "j", "down":
 		s.cursorDown(m)
@@ -604,7 +604,7 @@ func (w *watchScreen) update(m *Model, msg tea.Msg) tea.Cmd {
 		}
 	case "f":
 		return m.refreshFull()
-	case "escape", "q":
+	case "esc", "q":
 		return w.back(m)
 	case "down", "j":
 		w.navDown(m)

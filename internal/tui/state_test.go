@@ -545,6 +545,56 @@ func TestOpenAutoIdempotent(t *testing.T) {
 	}
 }
 
+// -- Esc dispatch (09§4.2 back bindings) ---------------------------------------
+//
+// bubbletea names the Escape key "esc" (never "escape"), so these press the real
+// key through each screen's update to pin that the advertised "esc Back" binding
+// actually fires.
+
+func TestEscKeyDispatch(t *testing.T) {
+	esc := tea.KeyMsg{Type: tea.KeyEscape}
+
+	t.Run("auto_pops", func(t *testing.T) {
+		host := &engineHost{}
+		m := newModel(&fakeFacade{backupDir: t.TempDir()}, "dashboard", WithEngineFactory(host.factory()))
+		m.pushScreen(newAutoScreen())
+		execAll(m.top().(*autoScreen).update(m, esc))
+		if len(m.stack) != 1 {
+			t.Fatalf("Esc must pop the auto screen; stack depth = %d", len(m.stack))
+		}
+	})
+
+	t.Run("switch_pops", func(t *testing.T) {
+		m := newTestModel(&fakeFacade{})
+		m.snapshot = snapshotOf("1", acct("1", "a@x.com", true, nil))
+		m.pushScreen(newSwitchScreen())
+		execAll(m.top().(*switchScreen).update(m, esc))
+		if len(m.stack) != 1 {
+			t.Fatalf("Esc must pop the switch screen; stack depth = %d", len(m.stack))
+		}
+	})
+
+	t.Run("watch_pops", func(t *testing.T) {
+		m := newTestModel(&fakeFacade{})
+		m.snapshot = snapshotOf("1", acct("1", "a@x.com", true, nil))
+		m.pushScreen(newWatchScreen())
+		execAll(m.top().(*watchScreen).update(m, esc))
+		if len(m.stack) != 1 {
+			t.Fatalf("Esc must pop the watch screen; stack depth = %d", len(m.stack))
+		}
+	})
+
+	t.Run("dashboard_submenu_pops", func(t *testing.T) {
+		m := newTestModel(&fakeFacade{})
+		d := m.top().(*dashboardScreen)
+		d.pushMenu("add account", d.addEntries())
+		execAll(d.update(m, esc))
+		if len(d.menuStack) != 1 {
+			t.Fatalf("Esc must pop the submenu to root; menu depth = %d", len(d.menuStack))
+		}
+	})
+}
+
 // -- helpers -----------------------------------------------------------------
 
 func hasToast(m *Model, message, title, severity string) bool {
