@@ -332,9 +332,12 @@ target with the most headroom first (`autoswitch.strategy best`). Setting the
 strategy to `soonest-reset` orders qualifying targets by weekly renewal
 instead: the account whose 7-day window — and any `autoswitch.model` weekly
 windows — refills earliest is tried first, so quota is spent where it returns
-soonest. Which accounts qualify does not change: a target must still be under
-the threshold and beat the active account by the hysteresis margin under
-either strategy.
+soonest. Qualification itself is unchanged. On a proactive switch, a target
+must still land under the threshold and beat the active account by the
+hysteresis margin. On an at-limit or failover switch neither check applies,
+but `soonest-reset` still never lets an early renewal beat the threshold: an
+account at or above the threshold is tried only after every account below
+it, regardless of how soon it renews.
 
 ```
 $ cswap config set autoswitch.strategy soonest-reset

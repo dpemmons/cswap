@@ -1000,17 +1000,41 @@ has no ranking axis beyond most-headroom, so this adds a second one without
 touching the Python-fidelity contract in `docs/port-spec/`.
 
 **Ordering only.** `internal/autoswitch/tick.go` `selectCandidates` changes
-exactly the sort of the already-built `qualifying` slice. Every qualification
-gate — `headroom != nil && > 0`, the proactive threshold-landing and
-hysteresis checks, cooldown, quarantine, and the API-key last resort — is
-IDENTICAL for both strategies and all three triggers (`proactive`, `at-limit`,
-`failover`). `best` stays byte-identical to today: headroom descending,
-`sort.SliceStable` so ties keep sequence order. `soonest-reset` sorts known
-renewal before unknown, known renewal ascending, then falls back to headroom
-descending and finally to sequence order (via `sort.SliceStable` over the
-sequence-ordered list) for remaining ties. Engine events are UNCHANGED —
-no new fields, `Poll`/`Switch`/`NoSwitch` stay byte-stable; the strategy is
-observable only through which account gets picked.
+exactly the sort of the already-built `qualifying` slice; it changes no gate.
+Known and positive headroom (`headroom != nil && > 0`), the cooldown,
+quarantine, and the API-key last resort are IDENTICAL for both strategies and
+every trigger (`proactive`, `at-limit`, `failover`). The threshold-landing
+and hysteresis checks apply only when `trigger == "proactive"`: an `at-limit`
+or `failover` tick has no in-force active account to land under the
+threshold against or beat by the hysteresis margin, so any candidate with
+positive headroom qualifies under those two triggers regardless of where it
+sits relative to the threshold.
+
+`sortQualifying` gains the threshold as a parameter —
+`sortQualifying(qualifying []qual, strategy string, threshold float64)`,
+called with `s.Threshold` — because the two-tier `soonest-reset` order below
+needs it even though it changes no qualification gate. `best` stays
+byte-identical to today: headroom descending, `sort.SliceStable` so ties keep
+sequence order; the threshold parameter is unused on this branch.
+
+`soonest-reset` becomes a two-tier comparator. Tier A holds every qualifying
+candidate whose utilization sits below the threshold — `(100 - h) <
+threshold` — and orders exactly as before: known renewal before unknown,
+known renewal ascending, then headroom descending, then sequence order (via
+`sort.SliceStable` over the sequence-ordered list) for remaining ties. Tier B
+holds every remaining qualifying candidate — utilization at or above the
+threshold, headroom still positive since an at-limit account never qualifies
+at all — and orders by headroom descending alone, as a last resort. Every
+tier-A candidate sorts before every tier-B candidate: an account at or above
+the threshold is never preferred over one below it for an earlier renewal.
+Under the `proactive` trigger tier B is always empty, since the
+threshold-landing gate above already excludes any candidate at or above the
+threshold from qualifying — proactive ordering is therefore unchanged from
+tier A alone. The tiering is observable only under the `at-limit` and
+`failover` triggers, where the threshold-landing gate does not apply and an
+at/above-threshold candidate can reach `qualifying`. Engine events are
+UNCHANGED — no new fields, `Poll`/`Switch`/`NoSwitch` stay byte-stable; the
+strategy is observable only through which account gets picked.
 
 **`oauth.RenewalTS` projection.** `internal/oauth/windows.go` gets one new
 exported function, `RenewalTS(u *Usage, models []string) *float64`, returning
@@ -1032,11 +1056,20 @@ headroom map so it can compute renewal per candidate.
 ` · soonest-reset` (plain segment, after the `poll every Ns` segment) only
 when `a.settings.Strategy != "best"`. `candidatesText` computes
 `oauth.RenewalTS` from `acc.Usage.LastGood` via `oauth.NewUsage` (mirroring how
-it already derives `bindingPct`) and, only under `soonest-reset`, ranks by
-composite tier instead of plain pct: tier 0 (has headroom, known renewal) by
-renewal ascending; tier 1 (has headroom, unknown renewal) by pct ascending;
-tier 2 (at/over limit) by renewal ascending with unknown renewal last in the
-tier, then pct ascending; tier 3 the existing sentinel (today key `998`); tier
-4 the existing usage-unknown case (`999`). Ties at every tier resolve by
+it already derives `bindingPct`) and, only under `soonest-reset`, ranks by a
+six-tier ladder (`candidateRank.tier`, ordered by `candidateLessSoonest`)
+that mirrors the engine's tier-A/tier-B split by the same threshold —
+`a.settings.Threshold`, the session-adjusted value the engine itself receives
+via `ApplyThreshold`. The method is on `autoScreen`, which already holds
+`a.settings`, so the threshold reaches both the tier assignment in
+`candidatesText` and `candidateLessSoonest` without a new parameter on either.
+The ladder: tier 0 (binding pct below the threshold, known renewal) by
+renewal ascending; tier 1 (pct below the threshold, unknown renewal) by pct
+ascending; tier 2 (pct at or above the threshold and below 100 — headroom
+remains, but the candidate is a last resort, mirroring the engine's tier B)
+by pct ascending, i.e. headroom descending; tier 3 (pct at or over 100,
+at/over limit) by renewal ascending with unknown renewal last in the tier,
+then pct ascending; tier 4 the existing sentinel (`bestKey` `998`); tier 5
+the existing usage-unknown case (`999`). Ties at every tier resolve by
 account number ascending, same as today. Under `best` the panel's ranking is
 untouched.

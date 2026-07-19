@@ -1948,23 +1948,37 @@ A whole-number float is stored and shown without a fractional part
 
 **`autoswitch.strategy` ordering.** The strategy governs only the order in
 which already-qualifying candidates are offered to `cswap auto`; it changes
-none of the qualification gates — known and positive headroom, the proactive
-threshold-landing and hysteresis checks, the cooldown, quarantine exclusion,
-and the API-key last resort — which apply identically under both values and
-for every trigger (`proactive`, `at-limit`, `failover`).
+none of the qualification gates. Known and positive headroom, the cooldown,
+quarantine exclusion, and the API-key last resort apply identically under
+both values and for every trigger (`proactive`, `at-limit`, `failover`). The
+threshold-landing and hysteresis checks apply only under the `proactive`
+trigger — an `at-limit` or `failover` tick must leave the active account
+regardless, so refusing every imperfect target would strand it — and a
+qualifying candidate reached by either of those two triggers may therefore
+sit at or above the threshold.
 
 - `best` orders candidates by headroom, most remaining first; accounts tied
   on headroom keep sequence order. This is the setting's default.
-- `soonest-reset` orders candidates by *renewal time*: the latest parseable
-  `resets_at` among the account's weekly-scope windows — the 7-day window
-  plus every per-model scoped window matched by `autoswitch.model`. The 5h
-  window is never part of the renewal, since it is not weekly. A window
-  whose `resets_at` is absent or unparseable is skipped; an account with no
-  parseable weekly `resets_at` at all has an *unknown* renewal. Candidates
-  with a known renewal sort before every candidate with an unknown renewal;
-  among known renewals the earliest sorts first. Ties — an equal renewal, or
-  two unknown renewals — fall back to headroom descending, then to sequence
-  order.
+- `soonest-reset` orders candidates by *renewal time*, in two tiers. The
+  first tier holds every candidate below the threshold — headroom such that
+  `100` minus headroom is under `autoswitch.threshold` — and ranks by the
+  latest parseable `resets_at` among the account's weekly-scope windows: the
+  7-day window plus every per-model scoped window matched by
+  `autoswitch.model`. The 5h window is never part of the renewal, since it
+  is not weekly. A window whose `resets_at` is absent or unparseable is
+  skipped; an account with no parseable weekly `resets_at` at all has an
+  *unknown* renewal. Within this tier, a known renewal sorts before an
+  unknown one; among known renewals the earliest sorts first; ties — an
+  equal renewal, or two unknown renewals — fall back to headroom descending,
+  then to sequence order. The second tier holds every candidate at or above
+  the threshold and ranks by headroom descending, as a last resort. This
+  tier is reachable only under the `at-limit` and `failover` triggers: under
+  `proactive`, the threshold-landing gate above already excludes such a
+  candidate from qualifying at all, so the second tier is always empty and
+  `soonest-reset` orders proactive candidates exactly as the first tier
+  describes. Every first-tier candidate sorts before every second-tier
+  candidate — a candidate at or above the threshold is never preferred over
+  one below it merely for an earlier renewal.
 
 ```
 $ cswap config set autoswitch.strategy soonest-reset

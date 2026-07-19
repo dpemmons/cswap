@@ -82,10 +82,45 @@ func TestCandidatesTextSoonestResetOrder(t *testing.T) {
 	a.settings = settings.Default()
 	a.settings.Strategy = "soonest-reset"
 	out := a.candidatesText(candidatesSnapshot()).plain()
-	// tier 0 (headroom+known renewal), renewal asc: 3 (07-19) before 2 (07-20);
-	// tier 1 (headroom, unknown renewal): 4; tier 2 (at limit), known renewal
-	// first: 5 (07-18) before unknown 6; tier 3 sentinel: 7; tier 4 unknown: 8.
+	// Every headroom account here is below the threshold, so: tier 0
+	// (below-threshold, known renewal), renewal asc: 3 (07-19) before 2 (07-20);
+	// tier 1 (below-threshold, unknown renewal): 4; tier 3 (at limit), known
+	// renewal first: 5 (07-18) before unknown 6; tier 4 sentinel: 7; tier 5
+	// unknown: 8. Tier 2 (over-threshold, below-limit) is empty in this snapshot.
 	assertOrder(t, out, []string{"acc3@x", "acc2@x", "acc4@x", "acc5@x", "acc6@x", "acc7@x", "acc8@x"})
+}
+
+// TestCandidatesTextSoonestResetThresholdTier fixes that an over-threshold (but
+// below-limit) candidate is never preferred for its early renewal: with the
+// earliest renewal of all it still sorts into tier 2, AFTER every below-threshold
+// candidate and BEFORE at-limit/sentinel/usage-unknown rows. Mirrors the engine's
+// sortQualifying threshold tiering (default threshold 90).
+func TestCandidatesTextSoonestResetThresholdTier(t *testing.T) {
+	a := newAutoScreen()
+	a.settings = settings.Default() // threshold 90
+	a.settings.Strategy = "soonest-reset"
+	snap := &reporting.AccountsSnapshot{
+		ActiveNumber: "1",
+		Accounts: []reporting.AccountSnapshot{
+			// over threshold (95%) with the EARLIEST renewal of all -> tier 2, not first.
+			candAcct("2", "acc2@x", sevenDay(95, "2026-07-18T00:00:00Z")),
+			// below threshold, known renewal (later) -> tier 0, still ahead of acc2.
+			candAcct("3", "acc3@x", sevenDay(30, "2026-07-25T00:00:00Z")),
+			// below threshold, unknown renewal -> tier 1.
+			candAcct("4", "acc4@x", sevenDay(50, "")),
+			// at limit -> tier 3.
+			candAcct("5", "acc5@x", sevenDay(100, "2026-07-19T00:00:00Z")),
+			// sentinel -> tier 4.
+			{Number: "6", Email: "acc6@x", Switchable: true,
+				Usage: usage.UsageEntry{Sentinel: "token expired"}},
+			// usage unknown -> tier 5.
+			candAcct("7", "acc7@x", nil),
+		},
+	}
+	out := a.candidatesText(snap).plain()
+	// tier 0: acc3; tier 1: acc4; tier 2 (over threshold): acc2 despite renewing
+	// earliest; tier 3: acc5; tier 4: acc6 sentinel; tier 5: acc7 usage-unknown.
+	assertOrder(t, out, []string{"acc3@x", "acc4@x", "acc2@x", "acc5@x", "acc6@x", "acc7@x"})
 }
 
 // TestSummaryTextStrategySegment checks the summary line gains a plain

@@ -543,6 +543,73 @@ func TestSoonestResetKnownRenewalBeatsUnknown(t *testing.T) {
 	}
 }
 
+// TestSoonestResetAtLimitPrefersBelowThreshold pins the ordering bug's fix under
+// the at-limit trigger: with the active account exhausted, an over-threshold
+// candidate (94% used) with the EARLIEST weekly renewal must NOT be preferred
+// for that renewal — a below-threshold candidate (30% used) renewing later wins.
+// The proactive threshold-landing gate never runs on an at-limit tick, so the
+// threshold tiering in sortQualifying is what keeps the over-threshold account
+// out of first place.
+func TestSoonestResetAtLimitPrefersBelowThreshold(t *testing.T) {
+	clk := newClk()
+	f := newFake()
+	f.current = strp("1")
+	f.switchable = []string{"1", "2", "3"}
+	f.emails = map[string]string{"1": "a", "2": "b", "3": "c"}
+	f.entries = map[string]usage.UsageEntry{
+		"1": dictEntry(usageOf(100, 0)), // active at-limit (headroom 0)
+		// candidate 2: 94% used (h 6, over threshold 90) with the EARLIEST renewal.
+		"2": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(94, "2026-07-19T00:00:00Z")}),
+		// candidate 3: 30% used (h 70, below threshold) with a LATER renewal.
+		"3": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(30, "2026-07-25T00:00:00Z")}),
+	}
+	s := settings.Default() // threshold 90
+	s.Strategy = "soonest-reset"
+	rec := &recorder{}
+	e := build(t, f, s, rec, clk, true) // dry-run: decide only, no freshen
+	if got := e.Tick(); got != Switched {
+		t.Fatalf("outcome = %v, want Switched (kinds=%v)", got, rec.kinds())
+	}
+	sw := rec.last("switch").(SwitchEvent)
+	if sw.Trigger != "at-limit" {
+		t.Errorf("trigger = %q, want at-limit", sw.Trigger)
+	}
+	if n := sw.ToRef["number"]; n != 3 {
+		t.Errorf("target = %v, want 3 (below-threshold beats early-renewing over-threshold)", n)
+	}
+}
+
+// TestSoonestResetAtLimitAllOverThresholdPicksMostHeadroom pins tier B ordering:
+// when EVERY qualifying candidate is over threshold under an at-limit trigger the
+// switch still happens (last resort, never Blocked), and among the over-threshold
+// last resorts the one with the most headroom wins — a 96%-used account renewing
+// tonight loses to a 92%-used account renewing later.
+func TestSoonestResetAtLimitAllOverThresholdPicksMostHeadroom(t *testing.T) {
+	clk := newClk()
+	f := newFake()
+	f.current = strp("1")
+	f.switchable = []string{"1", "2", "3"}
+	f.emails = map[string]string{"1": "a", "2": "b", "3": "c"}
+	f.entries = map[string]usage.UsageEntry{
+		"1": dictEntry(usageOf(100, 0)), // active at-limit
+		// candidate 2: 96% used (h 4) renewing tonight (earliest).
+		"2": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(96, "2026-07-18T20:00:00Z")}),
+		// candidate 3: 92% used (h 8) renewing later.
+		"3": dictEntry(map[string]any{"five_hour": win(5, ""), "seven_day": win(92, "2026-07-25T00:00:00Z")}),
+	}
+	s := settings.Default() // threshold 90
+	s.Strategy = "soonest-reset"
+	rec := &recorder{}
+	e := build(t, f, s, rec, clk, true)
+	if got := e.Tick(); got != Switched {
+		t.Fatalf("outcome = %v, want Switched (last resort, never Blocked) (kinds=%v)", got, rec.kinds())
+	}
+	sw := rec.last("switch").(SwitchEvent)
+	if n := sw.ToRef["number"]; n != 3 {
+		t.Errorf("target = %v, want 3 (most headroom among over-threshold last resorts)", n)
+	}
+}
+
 // -- item 18/19: idle-hold -------------------------------------------------
 
 func TestIdleHold(t *testing.T) {

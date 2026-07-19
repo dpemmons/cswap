@@ -286,7 +286,7 @@ func (e *Engine) selectCandidates(
 		}
 		qualifying = append(qualifying, qual{h: *h, renewal: renewalTS(usageDict(usageMap[num]), e.models), num: num})
 	}
-	sortQualifying(qualifying, s.Strategy)
+	sortQualifying(qualifying, s.Strategy, s.Threshold)
 	for _, q := range qualifying {
 		ordered = append(ordered, q.num)
 	}
@@ -307,14 +307,30 @@ type qual struct {
 
 // sortQualifying orders the qualifying targets per autoswitch.strategy. "best"
 // is headroom descending (byte-identical to the original single stable sort:
-// ties keep sequence order). "soonest-reset" ranks candidates with a known
-// weekly renewal ahead of those without, earliest renewal first, then falls
-// back to headroom descending, then to sequence order (Go-side extension,
+// ties keep sequence order); threshold is ignored. "soonest-reset" is
+// threshold-tiered so that an at/above-threshold account is never preferred for
+// its early renewal: it sorts after every below-threshold candidate, by
+// headroom, as a last resort. Tier A (utilization 100-h below threshold) ranks
+// candidates with a known weekly renewal ahead of those without, earliest
+// renewal first, then falls back to headroom descending, then to sequence order.
+// Tier B (utilization at/above threshold; at-limit accounts never qualify) is
+// ordered by headroom descending. Every tier-A candidate sorts before every
+// tier-B candidate. Under the proactive trigger tier B is always empty (the
+// qualification gate already excluded those), so proactive ordering is
+// unchanged; the tiering matters only for at-limit/failover (Go-side extension,
 // DESIGN A17).
-func sortQualifying(qualifying []qual, strategy string) {
+func sortQualifying(qualifying []qual, strategy string, threshold float64) {
 	if strategy == "soonest-reset" {
+		belowThreshold := func(q qual) bool { return (100.0 - q.h) < threshold }
 		sort.SliceStable(qualifying, func(i, j int) bool {
 			a, b := qualifying[i], qualifying[j]
+			aBelow, bBelow := belowThreshold(a), belowThreshold(b)
+			if aBelow != bBelow {
+				return aBelow // tier A (below threshold) before tier B (at/above)
+			}
+			if !aBelow {
+				return a.h > b.h // tier B: most headroom first (best-like last resort)
+			}
 			if (a.renewal != nil) != (b.renewal != nil) {
 				return a.renewal != nil // known renewal sorts before unknown
 			}
