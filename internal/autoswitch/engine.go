@@ -130,7 +130,7 @@ func NewEngine(sw Switcher, s settings.AutoSwitchSettings, onEvent func(Event), 
 		e.oauth = oauth.NewHTTPClient()
 	}
 	if e.statePath == "" {
-		e.statePath = filepath.Join(sw.BackupDir(), StateFilename)
+		e.statePath = StatePath(sw.BackupDir())
 	}
 	e.lockPath = filepath.Join(filepath.Dir(e.statePath), ".autoswitch_state.lock")
 	// Poll plans must key on the same threshold/models the engine decides with.

@@ -65,6 +65,7 @@ type autoScreen struct {
 	dryRun              bool
 	log                 []logLine
 	candidates          richText
+	quarantined         map[string]string
 	loaded              bool
 }
 
@@ -77,12 +78,22 @@ func (a *autoScreen) onMount(m *Model) tea.Cmd {
 	a.loaded = true
 	cmds := []tea.Cmd{m.setStoreOnly(true)}
 	a.settings = settings.Load(m.facade.BackupDir())
+	a.refreshQuarantine(m)
 	ct := a.settings.Threshold
 	a.configuredThreshold = &ct
 	tp := a.settings.Threshold
 	m.thresholdPct = &tp
 	cmds = append(cmds, a.startEngine(m, true))
 	return tea.Batch(cmds...)
+}
+
+// refreshQuarantine reloads the engine's quarantine set from the persisted
+// state file (<BackupDir>/autoswitch_state.json) so the candidates panel can
+// label the slots the engine excludes from its own candidate set (DESIGN A18).
+// Tolerant like every other state read: any read/parse problem leaves an empty
+// map, so a panel with a missing or unreadable state file labels nothing.
+func (a *autoScreen) refreshQuarantine(m *Model) {
+	a.quarantined = autoswitch.ReadQuarantine(autoswitch.StatePath(m.facade.BackupDir()))
 }
 
 // onExit runs the unmount sequence (09§4.2): stop the engine, un-pin the poll
@@ -98,8 +109,11 @@ func (a *autoScreen) onExit(m *Model) tea.Cmd {
 	return m.setStoreOnly(false)
 }
 
-// onSnapshot recomputes the candidates panel (09§4.7).
+// onSnapshot re-reads the quarantine set and recomputes the candidates panel
+// (09§4.7). The quarantine refresh rides the same cadence as the snapshot so a
+// slot the engine quarantines mid-session is labeled on the next poll.
 func (a *autoScreen) onSnapshot(m *Model) tea.Cmd {
+	a.refreshQuarantine(m)
 	if m.snapshot != nil {
 		a.candidates = a.candidatesText(m.snapshot)
 	}
@@ -313,24 +327,33 @@ func (a *autoScreen) endAdjust(m *Model) {
 
 // candidateRank carries both ranking keys so the panel can order candidates by
 // either strategy from the same pass. "best" compares bestKey (binding pct, or
-// the 998 sentinel / 999 usage-unknown sort keys) then account number.
-// "soonest-reset" is threshold-tiered so an at/above-threshold account is never
-// preferred for its renewal; it sorts after every below-threshold candidate, by
-// headroom, as a last resort. It compares tier (0 below-threshold+known renewal,
-// 1 below-threshold+unknown renewal, 2 at/over threshold but below limit, 3
-// at/over limit, 4 sentinel, 5 usage-unknown), then renewal/pct within the tier,
-// then account number (Go-side extension, DESIGN A17).
+// the 997 quarantined / 998 sentinel / 999 usage-unknown sort keys) then account
+// number. "soonest-reset" is threshold-tiered so an at/above-threshold account is
+// never preferred for its renewal; it sorts after every below-threshold
+// candidate, by headroom, as a last resort. It compares tier (0 below-threshold+
+// known renewal, 1 below-threshold+unknown renewal, 2 at/over threshold but below
+// limit, 3 at/over limit, 4 quarantined, 5 sentinel, 6 usage-unknown), then
+// renewal/pct within the tier, then account number (Go-side extension, DESIGN A17).
+//
+// Panel contract (DESIGN A18): a row ranked as a viable target is always one the
+// engine could pick this tick apart from freshness; every engine-unpickable row
+// is labeled with why (quarantined / sentinel / usage-unknown), the one exception
+// being disabled rows, which are dropped from the panel entirely.
 type candidateRank struct {
 	number  string
-	bestKey float64  // "best"-mode key: binding pct | 998 sentinel | 999 unknown
-	tier    int      // "soonest-reset" tier 0..5
+	bestKey float64  // "best"-mode key: binding pct | 997 quarantined | 998 sentinel | 999 unknown
+	tier    int      // "soonest-reset" tier 0..6
 	pct     float64  // binding pct (within-tier tiebreak; 0 when not applicable)
 	renewal *float64 // weekly renewal epoch (tiers 0/3; nil = unknown)
 }
 
 // candidatesText ranks switch targets on the same model axis the engine decides
 // with (09§4.7): remaining headroom for "best", or the tiered soonest-weekly-
-// renewal order for "soonest-reset" (Go-side extension, DESIGN A17).
+// renewal order for "soonest-reset" (Go-side extension, DESIGN A17). Quarantined
+// slots — which the engine excludes from its own candidate set — are kept in the
+// panel but labeled and ranked into the non-viable tail (above sentinel and
+// usage-unknown rows), so a row shown as a viable target is always one the engine
+// could pick this tick apart from freshness (panel contract, DESIGN A18).
 func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	models := settings.ParseModelNames(a.settings.Model)
 	threshold := a.settings.Threshold // session-adjusted; same value the engine gets
@@ -351,12 +374,20 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 		entry.addFg(fmt.Sprintf("\n  %2s  ", acc.Number), colForeground)
 		entry.addFg(acc.Email, colForeground)
 		switch {
+		case a.isQuarantined(acc.Number):
+			// The engine quarantined this slot (invalid_grant / identity conflict)
+			// and will never pick it until the credential is replaced, even though
+			// its cached usage may look healthy. Keep the row but label it and rank
+			// it into the non-viable tail (DESIGN A18). Quarantine takes precedence
+			// over the sentinel and usage cells below.
+			entry.addFg("  "+quarantineLabel(a.quarantined[acc.Number]), colSevWarn)
+			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 997.0, tier: 4})
 		case acc.Usage.Sentinel != "":
 			entry.addFg("  "+sentinelLabel(acc.Usage.Sentinel), colMuted)
-			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 998.0, tier: 4})
+			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 998.0, tier: 5})
 		case pct == nil:
 			entry.addFg("  usage unknown", colMuted)
-			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 5})
+			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 6})
 		default:
 			entry.add(fmt.Sprintf("  %3.0f%% used", *pct), segStyle{Fg: severityColorF(*pct)})
 			r := candidateRank{number: acc.Number, bestKey: *pct, pct: *pct,
@@ -393,8 +424,27 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	return out
 }
 
-// candidateLessBest is the "best" panel order: binding pct ascending (sentinel
-// 998, usage-unknown 999 sort last), ties by account number ascending.
+// isQuarantined reports whether a slot is in the engine's persisted quarantine
+// set. Membership, not the reason string, is the test: a quarantined entry may
+// carry an empty reason. Reads a nil map safely (nothing quarantined).
+func (a *autoScreen) isQuarantined(number string) bool {
+	_, ok := a.quarantined[number]
+	return ok
+}
+
+// quarantineLabel is the candidates-panel marker for a slot the engine has
+// quarantined: "quarantined (<reason>)", or a bare "quarantined" when the state
+// entry carried no readable reason (DESIGN A18).
+func quarantineLabel(reason string) string {
+	if reason == "" {
+		return "quarantined"
+	}
+	return "quarantined (" + reason + ")"
+}
+
+// candidateLessBest is the "best" panel order: binding pct ascending (quarantined
+// 997, sentinel 998, usage-unknown 999 sort last), ties by account number
+// ascending.
 func candidateLessBest(a, b candidateRank) bool {
 	if a.bestKey != b.bestKey {
 		return a.bestKey < b.bestKey
@@ -406,10 +456,12 @@ func candidateLessBest(a, b candidateRank) bool {
 // an at/above-threshold account is never preferred for its renewal; it sorts
 // after every below-threshold candidate, by headroom, as a last resort. Order by
 // tier (0 below-threshold+known renewal, 1 below-threshold+unknown renewal, 2
-// at/over threshold below limit, 3 at/over limit, 4 sentinel, 5 usage-unknown),
-// then within the tier by earliest weekly renewal (tier 0, and tier 3 with
-// unknown renewal last) or lowest pct (tiers 1/2, and as the tier-3 tiebreak),
-// then account number (Go-side extension, DESIGN A17).
+// at/over threshold below limit, 3 at/over limit, 4 quarantined, 5 sentinel, 6
+// usage-unknown), then within the tier by earliest weekly renewal (tier 0, and
+// tier 3 with unknown renewal last) or lowest pct (tiers 1/2, and as the tier-3
+// tiebreak), then account number. Tiers 4-6 carry no renewal/pct, so they fall
+// straight through to the account-number tiebreak (Go-side extension, DESIGN A17;
+// quarantine labeling DESIGN A18).
 func candidateLessSoonest(a, b candidateRank) bool {
 	if a.tier != b.tier {
 		return a.tier < b.tier

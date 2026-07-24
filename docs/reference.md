@@ -1548,7 +1548,13 @@ explicit targets there, since disabling holds an account out of automatic
 rotation rather than out of the roster. The auto-switch screen's ranked
 "Next best" candidates panel excludes disabled accounts entirely — an
 account held out of automatic rotation never appears in a ranking of
-automatic-switch targets.
+automatic-switch targets. A quarantined account (one the auto engine has
+sidelined for a dead or identity-mismatched stored credential; see
+`cswap auto` below) is not excluded the same way: the panel keeps its row
+but labels it "quarantined (<reason>)" in place of a usage figure, rather
+than ranking it as a target, since quarantine is transient and clears
+itself once the account's stored credential is replaced. Recovery is
+logging in with the account and running `cswap add`.
 
 ### Files
 

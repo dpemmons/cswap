@@ -1111,14 +1111,51 @@ same model axis... so the displayed ranking can never disagree with the
 account it picks." A disabled account ranked at the top of a display the
 engine will never act on breaks that contract on its face. The Go filter
 adds the missing disabled clause; the panel never shows a disabled
-account. (The panel still does not consult the engine's
-quarantine state, which lives in `autoswitch_state.json` rather than the
-snapshot — a quarantined slot with stored credentials can appear in the
-panel although the engine skips it. That narrower, transient gap is
-pre-existing, shared with the Python original, and out of this
-amendment's scope.) The existing "no other switchable accounts"
-empty-state line is unchanged and covers the all-remaining-disabled case
-as well.
+account.
+
+**Quarantine labeling.** The panel also reads the engine's quarantine
+state. `autoswitch.ReadQuarantine(statePath)` (`internal/autoswitch/state.go`)
+is a read-only, unlocked reader over `autoswitch_state.json`'s `quarantine`
+map, returning slot number to reason with the empty string standing for an
+entry that carries no readable reason. Its read is tolerant and lock-free,
+matching the engine's own `readState` at tick start exactly — missing
+file, parse error, or a non-object top level all yield an empty map — and
+`readState` and `ReadQuarantine` share one tolerant-read helper, so the two
+stay byte-identical by construction. `autoScreen` holds
+the result in a `quarantined map[string]string`, refreshed in both
+`onMount` and `onSnapshot` from `m.facade.BackupDir()` (mirroring how
+`loadThreshold` locates the settings file).
+
+A quarantined slot is not dropped the way a disabled slot is: disabling is
+a durable, user-chosen exclusion from the auto surface, so hiding the row
+costs the user nothing, while quarantine is transient and self-healing — it
+clears itself, with no action on the auto surface, the moment the slot's
+stored credential is replaced (`account-replaced` / `credentials-replaced`,
+spec 05§14). Dropping a quarantined row would tell the user only that a
+healthy-looking candidate is gone, not why or what to do about it.
+`candidatesText` labels the row instead: number and email render as
+usual, and the usage/sentinel cell is replaced by `"quarantined (<reason>)"`,
+or plain `"quarantined"` when the reason is empty, in the warning color
+(`colSevWarn`). Quarantine takes precedence over sentinel and usage
+rendering for that row — a quarantined slot's cached usage or sentinel
+value never reaches the panel once quarantined.
+
+Quarantined rows rank into the non-viable tail, above the sentinel and
+usage-unknown rows. Under `best`, `bestKey` `997` sorts after every pct row
+(pct is `<=100`) and before the `998` sentinel and `999` usage-unknown
+keys. Under `soonest-reset`, the tier ladder gains a non-viable tier and
+runs tier 0/1/2/3 (viable, as above; 3 = at/over limit) < tier 4
+(quarantined) < tier 5 (sentinel) < tier 6 (usage-unknown). Ties resolve by
+account number ascending, as at every other tier. This is the panel's
+contract restated in its strict form: a row ranked as a viable target
+(tier 0-3, pct `<=100`) is always one the engine could pick this tick,
+modulo cache freshness; every row the engine cannot pick — disabled
+excepted, which is dropped rather than shown — is labeled with the reason
+it cannot be picked. The existing "no other switchable accounts"
+empty-state line is unchanged and covers the all-remaining-disabled case;
+it does not cover an all-remaining-quarantined case, since a quarantined
+slot still contributes a labeled row rather than being excluded from the
+ranked set.
 
 **Marker color.** The account card and the mini list line
 (`internal/tui/widgets.go`, `~173` and `~249`) render their `(disabled)`

@@ -11,16 +11,27 @@ package autoswitch
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/atomicfile"
 	"git.dpemmons.com/dpemmons/cswap/internal/filelock"
 	"git.dpemmons.com/dpemmons/cswap/internal/oauth"
 )
 
-// readState reads the state file, swallowing any read/parse error and a
-// non-object top level → {} (05§5).
-func (e *Engine) readState() map[string]any {
-	data, err := os.ReadFile(e.statePath)
+// StatePath is the persisted cooldown/quarantine state file path under a backup
+// dir (<backupDir>/autoswitch_state.json). NewEngine defaults e.statePath the
+// same way; the TUI's read-only quarantine reader reuses this so the engine and
+// the panel that shadows it can never join the path differently.
+func StatePath(backupDir string) string {
+	return filepath.Join(backupDir, StateFilename)
+}
+
+// readStateFile reads and JSON-parses the state file at statePath, swallowing
+// any read/parse error and a non-object top level → {} (05§5). Lock-free, as
+// the engine's own read at tick start is. Both the engine's readState and the
+// exported ReadQuarantine funnel through this one tolerant read.
+func readStateFile(statePath string) map[string]any {
+	data, err := os.ReadFile(statePath)
 	if err != nil {
 		return map[string]any{}
 	}
@@ -33,6 +44,38 @@ func (e *Engine) readState() map[string]any {
 		return map[string]any{}
 	}
 	return m
+}
+
+// readState reads the state file, swallowing any read/parse error and a
+// non-object top level → {} (05§5).
+func (e *Engine) readState() map[string]any {
+	return readStateFile(e.statePath)
+}
+
+// ReadQuarantine returns the quarantined slots recorded in the state file at
+// statePath: slot number → reason ("" when the entry carries no readable
+// reason string). Tolerant like readState (missing file / parse error /
+// non-object top level → empty map) and lock-free, matching the engine's own
+// readState at tick start. Every key of the "quarantine" object is reported,
+// mirroring quarantinedSet, so the reader and the engine's exclusion set agree.
+//
+// This is the read seam the TUI's Auto "next best" panel uses to label the
+// quarantined slots the engine excludes from its candidate set but that would
+// otherwise rank as viable targets (DESIGN A18).
+func ReadQuarantine(statePath string) map[string]string {
+	out := map[string]string{}
+	q, ok := readStateFile(statePath)["quarantine"].(map[string]any)
+	if !ok {
+		return out
+	}
+	for num, raw := range q {
+		reason := ""
+		if entry, ok := raw.(map[string]any); ok {
+			reason, _ = entry["reason"].(string)
+		}
+		out[num] = reason
+	}
+	return out
 }
 
 // writeState atomically writes the state file (indent 2, 0600/0700), matching
