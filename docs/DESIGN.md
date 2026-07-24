@@ -668,6 +668,16 @@ committed under `testdata/` to enforce data compatibility.
     first argv token (`cswap --debug run 2` unsupported). A cobra port would silently
     change this (spec 06 §7.3). We keep the exact Python two-layer dispatch for
     fidelity — an explicit decision *not* to "improve" it.
+11. **TUI "Next best" candidates panel excludes disabled accounts** — Python's
+    `_candidates_text` filter admits any `switchable` account regardless of its
+    `disabled` flag, so a disabled account can top the displayed ranking even
+    though the auto engine's own candidate set, `SwitchableAccountNumbers`,
+    excludes disabled slots and could never pick it — breaking the panel's
+    documented contract that the display can never disagree with the pick
+    (spec 09 §4.7). The Go filter (`internal/tui/autoview.go`
+    `candidatesText`) also excludes `acc.Disabled`; the account card and
+    mini-line `(disabled)` marker renders in the warning color rather than
+    muted. See A18.
 
 ---
 
@@ -1073,3 +1083,49 @@ then pct ascending; tier 4 the existing sentinel (`bestKey` `998`); tier 5
 the existing usage-unknown case (`999`). Ties at every tier resolve by
 account number ascending, same as today. Under `best` the panel's ranking is
 untouched.
+
+## A18. TUI "Next best" panel excludes disabled accounts (Go-side deviation)
+
+`internal/tui/autoview.go`'s `candidatesText` filter (spec 09§4.7) gains one
+clause: skip `acc.Disabled`, alongside the existing exclusion of the active
+account and `!acc.Switchable`. This is a deliberate Go-side deviation from
+the Python original, recorded as an amendment rather than folded silently
+into the port, because the two filters read identically on paper while
+`Switchable` alone does not carry the meaning the auto engine assigns to
+its own candidate set.
+
+**The defect.** `reporting.AccountSnapshot.Switchable` reports only whether
+a slot has stored credentials and config (`store.AccountIsSwitchable`);
+`Disabled` is a separate, independent field. The auto engine's candidate
+set, `store.SwitchableAccountNumbers` (`internal/store/identity.go`),
+requires both: `AccountIsSwitchable && !disabled`. Python's
+`_candidates_text` carries the identical `switchable`-only filter
+(`switchable and account.number != active_number`; spec 09§4.7), so a
+disabled account with stored credentials can top the Python panel's ranking
+as well, though the engine can never select it. The defect is inherited
+from the Python original, not introduced by the port.
+
+**The correction.** The panel's documented contract, stated in Python's own
+source comment and carried into spec 09§4.7, is that it "uses the exact
+same model axis... so the displayed ranking can never disagree with the
+account it picks." A disabled account ranked at the top of a display the
+engine will never act on breaks that contract on its face. The Go filter
+adds the missing disabled clause; the panel never shows a disabled
+account. (The panel still does not consult the engine's
+quarantine state, which lives in `autoswitch_state.json` rather than the
+snapshot — a quarantined slot with stored credentials can appear in the
+panel although the engine skips it. That narrower, transient gap is
+pre-existing, shared with the Python original, and out of this
+amendment's scope.) The existing "no other switchable accounts"
+empty-state line is unchanged and covers the all-remaining-disabled case
+as well.
+
+**Marker color.** The account card and the mini list line
+(`internal/tui/widgets.go`, `~173` and `~249`) render their `(disabled)`
+marker in the warning color (`colSevWarn`) in place of the muted color
+(`colMuted`); text, spacing, and position are unchanged. This tracks the
+marker's meaning under this amendment: a disabled slot is a valid explicit
+switch/watch target but is never an automatic one. CLI (non-TUI) output is
+untouched — `cswap list`'s `(disabled)` marker
+(`internal/reporting/list.go`, via `printer.Muted`) stays exactly as it is,
+preserving byte-fidelity with the Python original for CLI surfaces.

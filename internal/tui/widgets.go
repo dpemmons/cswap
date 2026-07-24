@@ -170,7 +170,9 @@ func accountCardText(acc reporting.AccountSnapshot, width int, threshold *float6
 		t.add("   ● active", segStyle{Fg: colAccent, Bold: true})
 	}
 	if acc.Disabled {
-		t.addFg("   (disabled)", colMuted)
+		// Amber, not muted: a disabled account is held out of auto-rotation, a
+		// state worth surfacing (Go-side deviation, DESIGN A18).
+		t.addFg("   (disabled)", colSevWarn)
 	}
 	if acc.AtLimit {
 		t.add("   at limit: "+strings.Join(acc.LimitingWindows, ", "), segStyle{Fg: colSevCrit})
@@ -246,7 +248,7 @@ func miniAccountText(acc reporting.AccountSnapshot, now float64) richText {
 	}
 	t.addFg("  ["+acc.DisplayTag()+"]", colMuted)
 	if acc.Disabled {
-		t.addFg("  (disabled)", colMuted)
+		t.addFg("  (disabled)", colSevWarn) // amber, not muted (Go-side deviation, DESIGN A18)
 	}
 	t.addPlain("   ")
 

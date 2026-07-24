@@ -134,6 +134,38 @@ func TestMiniAccountPercentages(t *testing.T) {
 	}
 }
 
+// TestDisabledMarkerProminent verifies the "(disabled)" marker in the full
+// account card and the mini line is amber (SEV_WARN), not muted (Go-side
+// deviation, DESIGN A18). Text and spacing are unchanged; only the color is.
+func TestDisabledMarkerProminent(t *testing.T) {
+	lg := map[string]any{"seven_day": map[string]any{"pct": 40.0}}
+	card := reporting.AccountSnapshot{
+		Number: "1", Email: "a@x.com", IsActive: true, Disabled: true,
+		Usage: usage.UsageEntry{LastGood: lg},
+	}
+	assertDisabledMarkerColor(t, "card", accountCardText(card, 80, nil, 0))
+	mini := reporting.AccountSnapshot{
+		Number: "2", Email: "b@x.com", Switchable: true, Disabled: true,
+		Usage: usage.UsageEntry{LastGood: lg},
+	}
+	assertDisabledMarkerColor(t, "mini", miniAccountText(mini, 0))
+}
+
+// assertDisabledMarkerColor fails unless the segment carrying the "(disabled)"
+// marker is colored SEV_WARN (and its text/spacing is intact).
+func assertDisabledMarkerColor(t *testing.T, where string, rt richText) {
+	t.Helper()
+	for _, s := range rt.segs {
+		if strings.Contains(s.Text, "(disabled)") {
+			if s.Style.Fg != colSevWarn {
+				t.Fatalf("%s: (disabled) marker color = %q, want SEV_WARN", where, s.Style.Fg)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s: no (disabled) marker segment in %q", where, rt.plain())
+}
+
 func TestAccountsPanelEmptyHint(t *testing.T) {
 	snap := &reporting.AccountsSnapshot{}
 	got := accountsPanelText(snap, 80, true, nil, 0).plain()

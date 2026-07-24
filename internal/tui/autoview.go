@@ -337,7 +337,13 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	var ranked []candidateRank
 	lines := map[string]richText{}
 	for _, acc := range snap.Accounts {
-		if acc.Number == snap.ActiveNumber || !acc.Switchable {
+		// Skip the active account and non-switchable accounts (no stored
+		// creds/config), and also disabled accounts: the engine's candidate set
+		// excludes them (store SwitchableAccountNumbers = AccountIsSwitchable &&
+		// !disabled), so a disabled account can never be picked — ranking it here
+		// would let the displayed order disagree with every pick (Go-side
+		// deviation, DESIGN A18).
+		if acc.Number == snap.ActiveNumber || !acc.Switchable || acc.Disabled {
 			continue
 		}
 		pct := bindingPct(acc.Usage.LastGood, models)

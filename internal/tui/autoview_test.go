@@ -123,6 +123,49 @@ func TestCandidatesTextSoonestResetThresholdTier(t *testing.T) {
 	assertOrder(t, out, []string{"acc3@x", "acc4@x", "acc2@x", "acc5@x", "acc6@x", "acc7@x"})
 }
 
+// TestCandidatesTextExcludesDisabled fixes DESIGN A18: a disabled account is
+// excluded from the panel entirely, even when its usage would make it the single
+// strongest candidate. The engine's candidate set drops disabled accounts
+// (store SwitchableAccountNumbers = AccountIsSwitchable && !disabled), so ranking
+// one would let the displayed order disagree with every pick. The enabled
+// candidates must still rank correctly under both strategies.
+func TestCandidatesTextExcludesDisabled(t *testing.T) {
+	// The disabled account has the best usage of all (lowest pct + earliest
+	// renewal), so it would top the ranking under either strategy if included.
+	disabled := candAcct("2", "disabled@x", sevenDay(5, "2026-07-17T00:00:00Z"))
+	disabled.Disabled = true
+	snap := &reporting.AccountsSnapshot{
+		ActiveNumber: "1",
+		Accounts: []reporting.AccountSnapshot{
+			disabled,
+			candAcct("3", "acc3@x", sevenDay(20, "2026-07-25T00:00:00Z")), // best pct, latest renewal
+			candAcct("4", "acc4@x", sevenDay(40, "2026-07-20T00:00:00Z")), // higher pct, earlier renewal
+		},
+	}
+	cases := []struct {
+		strategy string
+		order    []string
+	}{
+		// "best": binding pct ascending — acc3 (20%) before acc4 (40%).
+		{"best", []string{"acc3@x", "acc4@x"}},
+		// "soonest-reset": both below threshold with a known renewal (tier 0),
+		// earliest weekly renewal first — acc4 (07-20) before acc3 (07-25).
+		{"soonest-reset", []string{"acc4@x", "acc3@x"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.strategy, func(t *testing.T) {
+			a := newAutoScreen()
+			a.settings = settings.Default() // threshold 90
+			a.settings.Strategy = tc.strategy
+			out := a.candidatesText(snap).plain()
+			if strings.Contains(out, "disabled@x") {
+				t.Fatalf("disabled account (best usage) must never appear in the panel:\n%s", out)
+			}
+			assertOrder(t, out, tc.order)
+		})
+	}
+}
+
 // TestSummaryTextStrategySegment checks the summary line gains a plain
 // " · soonest-reset" segment only when the strategy is not "best".
 func TestSummaryTextStrategySegment(t *testing.T) {

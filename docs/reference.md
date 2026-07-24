@@ -1543,6 +1543,13 @@ switch (`enter` confirm while a target is selected), `esc` back; on the
 auto-switch screen, `l` go live / dry-run, `t` threshold (with `←`/`→` to adjust
 and `enter` to finish while adjusting), `esc` back.
 
+Disabled accounts appear in the switch and watch lists and remain valid
+explicit targets there, since disabling holds an account out of automatic
+rotation rather than out of the roster. The auto-switch screen's ranked
+"Next best" candidates panel excludes disabled accounts entirely — an
+account held out of automatic rotation never appears in a ranking of
+automatic-switch targets.
+
 ### Files
 
 Reads and writes the same files the underlying commands do while the dashboard
