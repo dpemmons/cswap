@@ -154,13 +154,16 @@ func (h *engineHost) factory() EngineFactory {
 
 func floatPtr(v float64) *float64 { return &v }
 
+// acct builds a switchable, enabled account; RotationEligible tracks
+// reporting.Snapshot's derivation (Switchable && !Disabled).
 func acct(number, email string, active bool, fetchedAt *float64) reporting.AccountSnapshot {
 	return reporting.AccountSnapshot{
-		Number:     number,
-		Email:      email,
-		IsActive:   active,
-		Switchable: true,
-		Usage:      usage.UsageEntry{FetchedAt: fetchedAt},
+		Number:           number,
+		Email:            email,
+		IsActive:         active,
+		Switchable:       true,
+		RotationEligible: true,
+		Usage:            usage.UsageEntry{FetchedAt: fetchedAt},
 	}
 }
 

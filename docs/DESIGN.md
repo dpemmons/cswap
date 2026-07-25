@@ -196,6 +196,25 @@ func (l *FileLock) With(fn func() error) error           // ctx-manager form →
 POSIX `unix.Flock(fd, LOCK_EX|LOCK_NB)` 0.1s poll; Windows `LockFileEx` 1 byte.
 **Non-reentrant** — documented; callers never nest.
 
+Three measured facts (Linux; Windows status is A20 Known limitation (vii))
+govern every caller built on `FileLock`, and are load-bearing for A20's RULE 4:
+
+- **F1 — two handles, one process, same file, serialize like two processes.**
+  Two independent `*FileLock` objects opened on the same path from within a
+  single process contend at the OS `flock` level exactly as two separate
+  processes would; there is no in-process fast path between them.
+- **F2 — release on handle close or process death.** The OS-level lock
+  (`flock` / `LockFileEx`) releases automatically when the holding file
+  descriptor closes or its process exits; no explicit `Release` call is
+  required, and a crashed cswap leaves no stuck lock.
+- **F3 — an in-process waiter on the SAME `*FileLock` object ignores its own
+  timeout.** `Acquire` takes the `hold` mutex unconditionally before it enters
+  its timeout loop, so a goroutine sharing one `*FileLock` with the current
+  holder blocks on `hold` until that holder releases, regardless of the
+  timeout the waiter asked for — measured: a waiter requesting a 500ms
+  timeout blocked 3.001s, bounded only by the holder's own hold time. See A20
+  Known limitation (ii).
+
 ### 2.9 `credstore` — 03§5, 01§3
 `store.go` (interface), `filekeychain.go`, `active.go`, `backup.go`, `unclaimed.go`, `classify.go`
 ```go
@@ -1086,13 +1105,18 @@ untouched.
 
 ## A18. TUI "Next best" panel excludes disabled accounts (Go-side deviation)
 
-`internal/tui/autoview.go`'s `candidatesText` filter (spec 09§4.7) gains one
-clause: skip `acc.Disabled`, alongside the existing exclusion of the active
-account and `!acc.Switchable`. This is a deliberate Go-side deviation from
+`internal/tui/autoview.go`'s `candidatesText` filter (spec 09§4.7) skips a
+row when `acc.Number == snap.ActiveNumber || !acc.RotationEligible` —
+the active account, and every account the auto engine's own candidate set
+excludes, in one predicate. This is a deliberate Go-side deviation from
 the Python original, recorded as an amendment rather than folded silently
-into the port, because the two filters read identically on paper while
+into the port, because the Python filter reads identically on paper while
 `Switchable` alone does not carry the meaning the auto engine assigns to
-its own candidate set.
+its own candidate set. `RotationEligible` is `store.RotationEligible`'s
+rule, carried on the snapshot rather than re-ANDed here; ownership of the
+predicate, and of its call sites, belongs to A19, not this
+amendment — A18 documents the panel's filter contract, A19 the shared
+predicate the filter is stated in terms of.
 
 **The defect.** `reporting.AccountSnapshot.Switchable` reports only whether
 a slot has stored credentials and config (`store.AccountIsSwitchable`);
@@ -1110,8 +1134,8 @@ source comment and carried into spec 09§4.7, is that it "uses the exact
 same model axis... so the displayed ranking can never disagree with the
 account it picks." A disabled account ranked at the top of a display the
 engine will never act on breaks that contract on its face. The Go filter
-adds the missing disabled clause; the panel never shows a disabled
-account.
+closes over both conditions the engine requires (A19's `RotationEligible`);
+the panel never shows a disabled account.
 
 **Quarantine labeling.** The panel also reads the engine's quarantine
 state. `autoswitch.ReadQuarantine(statePath)` (`internal/autoswitch/state.go`)
@@ -1157,12 +1181,584 @@ it does not cover an all-remaining-quarantined case, since a quarantined
 slot still contributes a labeled row rather than being excluded from the
 ranked set.
 
-**Marker color.** The account card and the mini list line
-(`internal/tui/widgets.go`, `~173` and `~249`) render their `(disabled)`
-marker in the warning color (`colSevWarn`) in place of the muted color
+**Marker color.** The account card (`accountCardText`) and the mini list
+line (`miniAccountText`), both in `internal/tui/widgets.go`, render their
+`(disabled)` marker in the warning color (`colSevWarn`) in place of the muted color
 (`colMuted`); text, spacing, and position are unchanged. This tracks the
 marker's meaning under this amendment: a disabled slot is a valid explicit
 switch/watch target but is never an automatic one. CLI (non-TUI) output is
 untouched — `cswap list`'s `(disabled)` marker
 (`internal/reporting/list.go`, via `printer.Muted`) stays exactly as it is,
 preserving byte-fidelity with the Python original for CLI surfaces.
+
+## A19. `store.RotationEligible` — one owner for rotation eligibility; two audited limitations
+
+**One predicate, four call sites across three files, one inlined
+derivation.** `store.RotationEligible(data, num)` — `AccountIsSwitchable(num)
+&& !disabledFromData(data, num)` — is the single expression of "eligible to
+rotate onto by number alone." A nil `data` (roster absent or unreadable)
+makes it return false for every slot rather than falling through to
+`AccountIsSwitchable` alone; the predicate fails closed, never reporting a
+disabled slot eligible because its disabled flag could not be read. Four
+`s.RotationEligible(` call sites, across three files, call it directly, so
+none can compile an inline AND that has drifted from the predicate's own
+body: `store.SwitchableAccountNumbers` (`internal/store/identity.go`),
+`switching.selectBestSwitchable` (`internal/switching/strategies.go`), and
+`switching.switchFreshMachine`'s two decisions
+(`internal/switching/switch.go`) — detailed below.
+`reporting.Snapshot` (`internal/reporting/snapshot.go`)
+is a further, deliberate surface that does NOT call `store.RotationEligible`:
+the `RotationEligible` field of the `AccountSnapshot` it builds comes from a
+package-level helper local to `reporting`, `rotationEligible(data,
+switchable, disabled)` — `data != nil && switchable && !disabled`, the same
+fail-closed shape as the owner's, over the `Switchable` and `Disabled` values
+`Snapshot` already has in hand, to avoid a second per-account credential and
+config read inside the deliberately one-pass snapshot. The rationale is
+stated in the doc comment on `rotationEligible` itself, immediately below
+`Snapshot` in the same file, not inside `Snapshot`'s own body. That surface
+is guarded by a runtime parity test instead —
+`TestSnapshot_RotationEligible`
+(`internal/reporting/snapshot_test.go`), which compares the snapshot's
+eligible set against `store.SwitchableAccountNumbers` — not by the compiler.
+Naming and defining the rule once is not style: a divergence between an
+inline AND and the engine's own rule is exactly what A18 records — the TUI
+candidates panel filtered on `Switchable` alone, so a disabled account with
+stored credentials could rank at the top of a display the engine could never
+act on. The shared definition removes that class of divergence at compile
+time for its four call sites; the snapshot's inline copy remains a named,
+test-guarded duplication by design, not an oversight.
+
+**The boundary.** `RotationEligible` is necessary but NOT sufficient for the
+auto engine to select a slot. The engine additionally excludes the current
+account (it cannot switch onto itself), quarantined slots
+(`autoswitch_state.json`, A18), and API-key slots unless
+`autoswitch.includeApiKeyAccounts` is set. A `RotationEligible` account can
+therefore still be off the engine's candidate list for any of those three
+further reasons; the field tells a display "this slot is a legitimate
+rotation target in principle," not "the engine will pick it this tick."
+
+**`switch.go`'s rotation loop is the deliberate exception.** The bare
+`switch` no-target rotation loop, inside `Switch`
+(`internal/switching/switch.go`), keeps its own separate `disabledFromData`
+/ `!AccountIsSwitchable` tests rather than calling `RotationEligible`,
+because it emits a distinct skip warning worded per reason —
+`(disabled)` versus `(no stored credentials/config)` — across a whole loop
+of candidates, and `RotationEligible` collapses that distinction by design.
+`switchFreshMachine` is not a second exception: both of its decisions —
+whether to skip its preferred target, and which fallback to select once
+skipped — call `s.RotationEligible` directly. Its own `disabledFromData`
+call on the preferred target survives only to WORD the one notice that
+target can produce (`(disabled)` versus the re-add hint); it plays no part
+in deciding whether to skip it, which is `RotationEligible`'s decision
+alone.
+
+### Known limitations (audited, accepted)
+
+Two narrow windows are inherited from the Python original and are
+deliberately NOT closed: each is self-healing, each has a low-probability
+trigger, and closing either costs more machinery than the residual risk
+justifies.
+
+**(i) A rotated OAuth token can be lost on a lock-timeout race during a
+background usage-fetch refresh.** `internal/oauth/fetch.go` performs the
+network refresh before acquiring the store lock (the lock is non-reentrant,
+so it cannot be held across a network call); the persist that follows
+(`persistCredentials`) can then fail to acquire it. Its failure path
+(`internal/oauth/fetch.go`) logs a warning and prints a notice — there is no
+rollback and no retry. The store lock timeout is 10s
+(`filelock.DefaultTimeout`); the realistic trigger is a long-held lock, such
+as a macOS Keychain prompt blocking a concurrent switch. Consequence: that
+slot's stored refresh token is stale, and its next refresh fails
+`invalid_grant`. Recovery: log in with the account and run `cswap add`.
+
+**(ii) A CLI switch strategy can install a credential the engine has just
+quarantined.** `internal/switching/strategies.go` filters candidates on
+rotation eligibility only; it does not consult `autoswitch_state.json`'s
+quarantine map. Within the usage cache's serve window, a manual
+`cswap switch --strategy best` can therefore select a slot the auto engine
+quarantined moments earlier, installing a credential whose refresh token is
+already dead. Consequence: the installed access token works until it
+expires, then the account fails; auto-switch fails over, and the usage
+store's dead-token strikes surface as "re-login needed." Recovery: log in
+with the account and run `cswap add`. A naive fix — have the CLI strategy
+skip quarantined slots — is unsafe on its own: quarantine entries are
+released only by a real engine tick
+(`releaseRecoveredQuarantines`), so a CLI-side check keyed on slot number
+alone would wrongly exclude a slot whose credential was already replaced
+and recovered. Closing this gap correctly requires comparing the slot's
+current credential fingerprint against the quarantine entry's
+`refreshTokenFingerprint`, not merely checking slot membership in the
+quarantine map.
+
+## A20. Roster read failure: absence heals, corruption refuses (Go-side deviation from Python)
+
+`store.ReadSequence` (`internal/store/sequence.go`) collapses two distinct
+causes of a nil result into one `(nil, nil)`, matching Python's `None` (spec
+01§2.3): the roster file is absent, or the file is present but does not
+parse (0-byte, truncated, malformed JSON, or a top-level JSON `null`). Many
+callers, and Python parity, depend on that collapse for the paths that only
+display or inspect the roster; it stays exactly as it is. A write-capable
+path cannot use it, because the two causes demand opposite answers: an
+absent file is a fresh install (an empty roster is the truth, and proceeding
+is healing), while a present-but-unparseable file is corruption (the account
+records it held — emails, aliases, uuids, orgs, slot mapping — are
+frequently hand-repairable ASCII, and the credential and config backups
+those records point at are still intact on disk, referenced by nothing
+else). The Python original does not distinguish them: it substitutes an
+empty roster for both alike and, on a write path, proceeds to write it,
+silently replacing a corrupt roster with an emptied one (plus whatever the
+run adds) while every account's credential and config backups stay on disk,
+orphaned. This is a deliberate Go-side deviation from that behavior.
+
+**RULE 1 — an entry read that can write classifies absence from
+corruption, and refuses on corruption.** Every write-capable operation,
+repo-wide, begins with exactly one classified entry read — `store.SequenceForUpdate`,
+or `store.MigratedSequenceForUpdate` wherever the org-field backfill must run
+first (`internal/store/sequence.go`, `internal/store/identity.go`) — with the
+same two outcomes:
+
+- absent — an empty roster; the operation proceeds, a fresh install with no
+  accounts yet being the truth, not an error.
+- present and unparseable — the operation refuses instead of writing over
+  it, with a `cerr.Config` error naming the `sequence.json` path. Its text
+  states what the user needs in order to act: the account backups
+  (credentials and config) the roster indexes are intact on disk; the file
+  is JSON and may be hand-repairable (emails, aliases, uuids, orgs, and slot
+  numbers are ordinary ASCII fields); and removing the file outright is
+  also an option, but one that re-registers every account from scratch —
+  the next `add` / `add-token` starts an empty roster rather than
+  recovering the existing slot numbers, aliases, or org fields the removed
+  file held. Nothing is written; the bytes on disk survive for repair.
+
+Scope is every write-capable path repo-wide, not only `internal/lifecycle`:
+`AddAccount` (add.go), `AddAccountFromToken` (addtoken.go), `RemoveAccount`
+(remove.go), `SetAlias` and `UnsetAlias` (alias.go), `SetAccountDisabled`
+(disable.go), and `MoveAccount` and `SwapAccounts` (moveswap.go) each reach
+RULE 1's classification through `store.WithRosterLocked` (RULE 4) rather
+than a direct `SequenceForUpdate` call; `RemoveAccount` alone additionally
+takes an advisory copy of the same classified, backfilled read on its own,
+unlocked, through `MigratedSequenceForUpdate`, ahead of its confirmation
+prompt (RULE 4). `transfer.Import` (`internal/transfer/import.go`) is in
+scope on the same footing: it is a write-capable path that can persist a
+roster, through its own consumer-defined store interface (`transfer.Accounts`,
+DESIGN A2) rather than `store.Store` directly. RULE 1's classification
+governs a write to `sequence.json` on the strength of what that write does,
+not which package issues it — the mechanism a caller reaches
+`store.WriteSequence` through does not change the guarantee.
+
+The invariant this enforces is narrower than "every write begins with a
+classified read": no write-capable path destroys a roster it never
+classified as parsed. Three further `WriteSequence` call sites exist outside
+the operations named above and do not begin with a classified read; none is
+a counterexample, because each is structurally unable to reach its write
+with a roster that did not already parse:
+
+- `internal/switching/perform.go` commits `activeAccountNumber` twice — once
+  in `directActivate`'s commit closure, once in `normalSwitchBody` — onto
+  the `*SequenceData` `performSwitch` obtains from its own single,
+  unclassified `ReadSequence`, taken under `withTripleLock`. That pointer is
+  dereferenced for the current active slot immediately after the read, with
+  no nil guard: an absent or unparseable roster is nil there, and the
+  dereference panics before either commit site is reached. A crash is not a
+  write, so the operation still cannot commit over an unclassified roster —
+  the failure mode is a goroutine panic, not a graceful refusal.
+- `internal/switching/transaction.go`'s `rollbackStep`, case
+  `"sequence_updated"`, reads through an unclassified `ReadSequence` and
+  nil-guards explicitly (a nil result returns without writing). It commits
+  only `activeAccountNumber`, never an account record.
+- `internal/store/credproxy.go`'s `BackfillAccountUUID` reads through an
+  unclassified `ReadSequence`, nil-guards identically, and commits only one
+  record's `uuid` field, and only when that field was previously empty.
+
+Each of the three is nil-guarded against, or otherwise unreachable over, an
+unparseable roster; each commits only a field already inside a record that
+parsed, never a new record or a replaced `Accounts` map. RULE 1's refusal
+exists to stop a corrupt file from being silently renamed away with its
+records lost; none of these three sites can do that.
+
+`internal/store/identity.go`'s `migrateOrgFields`, reached through
+`SequenceMigrated`, is not a further exception: it classifies its own entry
+read too, through the same `classifiedRoster` call `SequenceForUpdate` is
+built on, and refuses with the same `cerr.Config` a corrupt file produces
+anywhere else, before its `WriteSequence` call ever runs.
+
+**The classifier.** `SequenceForUpdate` and `ReadSequence` are two views of
+one read: a single `os.ReadFile` followed by one `json.Unmarshal` into
+`SequenceData`, never a follow-up `os.Stat` — a file created or removed
+between two syscalls would be classified as the opposite case, and this
+classification decides whether user data is destroyed. Five refinements
+keep that single read from misclassifying bytes that only look like a
+roster, and from handing back a result a later step can crash on:
+
+- a top-level JSON `null` is not a roster. Unmarshaling `null` into a
+  struct target is a silent no-op that would otherwise leave `Accounts` and
+  `Sequence` nil and classify the document as a healthy empty roster rather
+  than as unreadable; the classifier treats it as unreadable, and it is
+  refused like any other unparseable file.
+- a parsed JSON object is accepted, but normalized: `Accounts` and
+  `Sequence` are never nil on a successful classification, whether or not
+  the source carried those keys. An object with no `accounts` key holds no
+  records, so nothing is lost by proceeding with it; what may never happen
+  is a later assignment into a nil map (`lifecycle.putRecord` assigning
+  into `data.Accounts` is exactly the call this closes against panicking
+  after credential and config backups have already been written).
+- an individual account record is normalized the same way: `decodeRecord`
+  (`internal/store/sequence.go`) yields an empty `map[string]any` rather
+  than nil when a record's own bytes fail to parse, so a field accessor
+  (`strField`, `recordFor`) never indexes a nil map. Neither the roster's
+  `Accounts` map nor any record inside it is ever nil after classification
+  succeeds.
+- an existing file that cannot be read at all — a directory sits where the
+  file should, or its mode denies read access — is unreadable in exactly
+  the sense malformed JSON is, and yields the same actionable `cerr.Config`
+  refusal rather than the raw OS error.
+- the org-field backfill cannot act on a roster it cannot parse.
+  `SequenceMigrated`, which `MigratedSequenceForUpdate` runs ahead of its
+  own classified read, calls `classifiedRoster` directly — the same
+  classification `SequenceForUpdate` is built on — before deciding whether a
+  backfill is needed; `migrateOrgFields` calls it again before its own
+  write, since a roster can go unreadable between the two calls. Either call
+  refuses with the same `cerr.Config` a corrupt file produces anywhere else,
+  before the backfill's `WriteSequence` runs — so a corrupt file is refused,
+  not silently written over, regardless of which of the two classified reads
+  reaches it first.
+
+`ReadSequence`'s own `(nil, nil)` contract for absent-or-unparseable carries
+these refinements too, but reports them identically as before: the
+classification lives beside that read, computed from the same single
+`os.ReadFile`, and only `SequenceForUpdate` acts on which of the two
+outcomes occurred.
+
+**A command that writes nothing itself can still surface RULE 1's refusal,
+by way of the org backfill.** `SequenceMigrated` (`internal/store/identity.go`)
+looks read-only from every caller's side — it returns a roster, never a
+commit signal — but its own body can end in a `WriteSequence` (the backfill),
+so RULE 1 requires it to classify before running, exactly as any other
+write-capable entry read does. `ResolveAccount` (same file) calls
+`SequenceMigrated` first for the same reason. A caller that propagates either
+function's error inherits RULE 1's refusal even though the caller's own
+command never touches `sequence.json`. Five do: `lifecycle.ListAliases`
+propagates it for `cswap alias` with no arguments; `store.ResolveAccount`
+propagates it for `cswap env <id>`, `cswap map <id>`, and `cswap run <id>`
+(each resolves through it — `session.Manager.setupPreamble`/`SetupSession`
+for the first and third, `cli.mapCommand` for the second);
+`core.Switcher.SlotForDirectory` propagates it for a bare `cswap env` or
+`cswap run` resolving the current directory's mapping; and `transfer.Export`,
+through its `MigratedSequence` adapter method, propagates it for
+`cswap export`. Each reports `corruptSequenceError`'s `cerr.Config` text and
+exits 1 in place of what it gives an absent (not corrupt) roster:
+`cswap alias` prints "No aliases set" for absent, refuses for corrupt;
+`cswap env`/`cswap map <id>`/`cswap run <id>` report `AccountNotFoundError`
+for absent (the identifier resolves against zero accounts), refuse for
+corrupt; `cswap export` already errors on absent (`cerr.Transfer("no
+accounts to export...")`), so corrupt trades one error message for a more
+specific one — the misleading "no accounts to export" for the diagnostic
+refusal naming the file and the intact backups.
+
+Not every read-only surface propagates it. `reporting.BuildAccountsInfo`
+(`cswap list`), `reporting.buildStatusPayload` / `renderStatus`
+(`cswap status`), `reporting.Snapshot` (`cswap tui` / `cswap watch`), and the
+bare, no-argument `cswap map` listing (`cli.listMappings`) all discard
+`SequenceMigrated`'s or `ReadSequence`'s error and keep the collapse: a
+corrupt roster displays as an empty one there, silently. This is not a gap
+to close — RULE 1 governs writes, and none of these four ever writes
+`sequence.json` — it is the boundary between the commands the refusal
+reaches and those it does
+not, and it means the two behaviors coexist by design on the same corrupt
+file depending on which command is run against it.
+
+Truthful refusal is preferred to the fabricated empty result the discarding
+surfaces still give, for the same reason RULE 1 refuses on a write:
+"No aliases set" against a roster that cannot be read is not the true
+answer "there are no aliases" — it is the unreadable-roster case, reported
+as if it were the empty-roster case. A user who set three aliases and then
+hit a truncated `sequence.json` is told none were ever set; nothing steers
+them toward the file that still holds the answer. Refusing costs one failed
+command, the same price RULE 1's own rationale already accepts for a write;
+fabricating an empty result costs the user the fact that anything is wrong
+at all.
+
+**RULE 3 — a read-only resolution site refuses too, so a miss is never
+confused with corruption.** `SetAlias` and `UnsetAlias` (alias.go),
+`SetAccountDisabled` (disable.go), and `MoveAccount` (moveswap.go) each
+resolve their identifier only after `store.WithRosterLocked`'s classified
+entry read has already succeeded; a corrupt roster is refused there, before
+resolution runs, so resolution is never asked to answer against a roster it
+cannot trust. `SwapAccounts` (moveswap.go) reaches that same entry read the
+same way, through its own `WithRosterLocked` call. `relocateLocked` — the locked body
+`MoveAccount` hands the read roster to on its non-swap branch — takes that
+roster as a parameter and reads the file no further. `swapAccountsLocked`
+takes the same kind of parameter but resolves each of its two identifiers
+itself, through its own `ResolveAccount` call, and `ResolveAccount` runs
+`SequenceMigrated` (a further `ReadSequence`, gated on a backfill this
+span's entry read has already satisfied) plus its own `ReadSequence`. Both
+extra reads are harmless here: the `FileLock` `MoveAccount` / `SwapAccounts`
+already hold excludes every other writer for its duration, so neither read
+can observe a write from any other process, and each slot number
+`ResolveAccount` returns is re-checked against the roster passed in
+(`data.Accounts[numA]`, `okA`, and the `numB` equivalent) before it is
+trusted — a resolution and the roster the operation commits can never
+disagree. Left unguarded, a resolution step given no roster, or a nil
+roster silently treated as empty, would land on the same
+`cerr.AccountNotFound("No account found with identifier: %s", ...)` a
+genuine typo produces; corruption and "no such account" would be
+indistinguishable to the user and to a test. RULE 1's refusal upstream of
+every resolution call is what keeps the two apart.
+
+**RULE 4 — the read-decide-write span of a roster-mutating operation runs
+under the store lock, with exactly one classified read taken inside it.**
+`store.WithRosterLocked` (`internal/store/rosterlock.go`) is the shape:
+it acquires the store `FileLock`, runs the org-field backfill, takes the
+roster read the operation's decisions are made from
+(`MigratedSequenceForUpdate`, RULE 1's classifier), and hands that roster
+to the caller's function — every `WriteSequence` call the operation makes
+runs inside that function, so the acquisition spans the whole
+decide-and-commit sequence, not merely the read. `AddAccount` (add.go),
+`AddAccountFromToken` (addtoken.go), `RemoveAccount` (remove.go), `SetAlias`
+and `UnsetAlias` (alias.go), `SetAccountDisabled` (disable.go), and
+`MoveAccount` and `SwapAccounts` (moveswap.go) — RULE 1's full scope, less
+`transfer.Import` — call it; the eight operations converge onto the same
+shape rather than each inventing its own. `transfer.Import` does not call
+it: RULE 1 places it in scope on a different footing, reaching its
+classified read through its own `*filelock.FileLock` and its own
+consumer-defined `transfer.Accounts` interface rather than through
+`store.Store`, so it has no `store.WithRosterLocked` call to make. This
+list is the one an entry point consults before taking the store `FileLock`
+of its own accord: `FileLock` is non-reentrant, and its `Acquire` takes the
+in-process `hold` mutex before it ever consults a timeout (F3, §2.8), so
+calling `store.WithRosterLocked` — or acquiring the same `*store.FileLock`
+any other way — from inside one of these eight operations' own locked span
+is a permanent, timeout-free goroutine hang, not a slow acquisition.
+
+*What is atomic, and against what.* The span from the locked classified
+read to the operation's last `WriteSequence` call is atomic against every
+other write-capable path that reaches `sequence.json` through the same
+`FileLock` — by RULE 1's scope, every write-capable path in the repository.
+Two overlapping runs of any two of these operations do not lose a record:
+the second run's classified read cannot start until the first run's writes
+and lock release have completed, so it always decides from a roster that
+already carries the first run's commit. Measured without the lock, two
+concurrent `AddAccountFromToken` calls against one store lose a record and
+both report success, in every run; under the lock, both records and both
+accounts' backups survive, in every run.
+
+*What a caller may assume about the roster it holds.* A roster obtained
+inside the lock is current for the whole acquisition: no other writer can
+act on `sequence.json` between the classified read and any of the
+operation's own commits, so the roster a slot-occupancy, identity-collision,
+or confirmation decision is made from and the roster the operation
+eventually writes are the same roster — not merely the same in-memory
+object by construction, but the same bytes on disk, because nothing else
+could have changed them in between.
+
+*Where the lock is NOT held: never across a human prompt.* Reading a
+confirmation from the terminal blocks for as long as the user takes; the
+store lock's cross-process acquire budget is bounded (`filelock.DefaultTimeout`,
+10s) precisely so that nothing holding it can block indefinitely.
+`AddAccount`'s slot-displacement confirmation, `AddAccountFromToken`'s
+slot-overwrite confirmation, and `RemoveAccount`'s removal confirmation
+therefore all run BEFORE the lock is acquired, decided from an advisory read
+taken only to decide whether a prompt is needed at all and what identity to
+show in it. That advisory read governs nothing the write depends on: it is
+superseded by the locked read, never merged with it.
+
+`RemoveAccount`'s advisory read is a direct, unlocked
+`MigratedSequenceForUpdate` call: classified, so an unparseable file refuses
+before the prompt is ever shown, and backfilled, because the multi-match
+disambiguation list renders each candidate's org tag from the record the
+backfill fills in — an un-backfilled pre-v0.6.0 record would print every
+same-email candidate as `[personal]` on the one screen whose purpose is
+telling them apart. Its confirmation premise is the email alone, which the
+backfill does not touch, so nothing here can misread a backfill as the slot
+changing hands, and the read needs no locked acquisition to protect that
+premise. `AddAccount` and `AddAccountFromToken` take theirs through a
+SEPARATE, short `WithRosterLocked` acquisition that is released before the
+prompt is printed — one acquisition to look, none while the human thinks,
+one to commit. The reason is the org-field backfill: their premise is the
+composite `(email, organizationUuid)` identity, and on a pre-v0.6.0 roster
+an unlocked read taken before the backfill reports `organizationUuid` as
+absent where the locked read (which runs the backfill first) reports the
+recovered value — the re-validation below would then read a backfill as
+the slot changing hands and refuse a confirmation the user correctly gave.
+Reading both premises through the same classified, backfilled path removes
+that false abort, and it keeps the backfill's own write under the lock
+rather than adding an unlocked one.
+
+*Prompts are re-validated, not trusted.* The read that governs the write
+is the locked, classified read described above, taken after the prompt (if
+any) has returned. When a prompt preceded it, the operation re-validates
+the premise the prompt showed against this read before taking any
+destructive step:
+
+- the slot's occupant matches what the prompt showed → proceed as
+  confirmed;
+- the slot is now free → proceed with no destructive step, since there is
+  nothing left to displace;
+- the slot holds a different identity than the prompt showed, or the
+  operation needed a confirmation it never obtained → refuse with
+  `cerr.Config`, naming the slot and what it now holds, and write nothing.
+
+`AddAccount`'s displacement decision and `AddAccountFromToken`'s overwrite
+decision both take this form. `RemoveAccount` re-resolves its identifier
+under the lock rather than trusting its pre-prompt resolution: a slot key
+absent from the locked roster is checked against the confirmed identity's
+composite (email, organizationUuid) across the whole roster — found under a
+different slot, a concurrent move or swap has renumbered it, and the
+operation refuses, naming the new slot; found nowhere, another cswap has
+already removed it, and there is nothing to do (no error) — and a slot key
+present but holding a different email than the one confirmed refuses. Both
+replace what would otherwise be a second, unlocked classified read taken
+after the prompt with the SAME locked read the operation's write is already
+made from — safe because the store `FileLock` this acquisition already
+holds excludes every other writer for the rest of it: once the locked
+classified read has been taken, no write from any other process can land
+between it and this re-validation, so a second look at the same in-memory
+roster could only ever agree with the first. A changed premise always
+aborts or de-escalates; it never destroys — the failure mode RULE 1 already
+refuses to walk into, extended from "the file was corrupt" to "the file
+changed while a human was answering a question about it."
+
+*Scope boundary.* `Purge` (`internal/lifecycle/purge.go`) is out of scope:
+it deletes the directory the lock file lives in, so there is no lock left
+to hold across it. `internal/switching` is out of scope on different
+grounds — its roster-mutating span already runs under `withTripleLock`
+(`internal/switching/switching.go`), which acquires the same store
+`FileLock` first in a three-lock stack, and has since the port.
+`internal/reporting` never writes `sequence.json`. No re-entrancy mechanism
+exists or is needed: the store `FileLock` remains non-reentrant, and each
+of these operations acquires it exactly once, itself, never calling into
+another lock-taking operation from inside its own acquisition.
+
+**Rationale.** Overwriting a corrupt roster is silent and irreversible: the
+account records it held are frequently hand-repairable ASCII, and the
+credential and config backups those records point at are still intact on
+disk, referenced by nothing else. A write that replaces the roster with an
+emptied one destroys the repairable records and orphans the backups in the
+same stroke, with no warning and no way back. Refusing costs the user one
+failed command; it is fully recoverable by repairing the file, by removing
+it and re-registering, or simply by retrying once whatever produced the
+truncation (a crash mid-write, a hand edit) has been addressed. Between a
+mistake that costs one command and one that destroys data, this design
+always takes the former.
+
+### Known limitations (accepted)
+
+RULE 4 governs the roster-level lost update: without its locked span, two
+concurrent `AddAccountFromToken` runs against one store lose a record and
+both report success, in every run. Nine residuals remain. None is
+roster-level data loss; none is claimed fixed by
+this design that is not.
+
+**(i) The locked span is not transactional across files.** RULE 4 makes the
+roster read-decide-write atomic; it does not extend that atomicity to the
+credential and config backups an operation also writes. A failure inside
+the lock after `WriteAccountCredentials` / `WriteAccountConfig` but before
+the operation's final `WriteSequence` call — disk-full, a permission error,
+a process kill — leaves a credential and config pair on disk with no
+roster record naming it: the same orphaning this amendment's own rationale
+treats as irreversible for a corrupt file, arising here from a mid-operation
+failure instead of a hand-edited one. Trigger: a write failure between a
+backup write and the commit, in any of the eight operations RULE 4 names.
+Consequence: an orphaned credential/config pair, recoverable only by hand
+(the bytes are intact; nothing indexes them). It is the one orphaning path
+that survives locking the roster read-modify-write itself.
+
+**(ii) In-process contention on the same `*store.FileLock` object ignores
+the caller's requested timeout (F3, §2.8).** `FileLock.Acquire` takes its
+`hold` mutex unconditionally before it ever consults a timeout, so a
+goroutine sharing one `*store.Store` with a current holder waits for that
+holder to release, not for its own requested timeout, however long that
+takes. A process that hosts more than one lock-taking actor over one
+`*store.Store` — the TUI, which runs lifecycle actions and the autoswitch
+engine's ticks in one process — can have an action queue behind a tick, or a
+tick behind an action, with no bound and no wait indicator: a tick stalled
+on a slow network refresh, or an action stalled on a macOS Keychain prompt,
+silently stalls the other. This risk does not appear in a suite that never
+exercises two lock-taking actors sharing one process, which is every
+current automated test.
+
+**(iii) A contended lifecycle operation now fails outright instead of
+racing to a silent loss.** Cross-process, a locked acquisition that cannot
+obtain the `FileLock` within `filelock.DefaultTimeout` (10s) returns
+`cerr.Lock("Failed to acquire lock - another instance may be running")`
+rather than proceeding unlocked. Session bootstrap's own acquire attempt on
+the same lock uses a larger figure, `bootstrapLockTimeout`
+(`internal/session/manager.go`, 30s) — an ACQUIRE budget, how long bootstrap
+itself waits to obtain the lock, not a bound on how long bootstrap then
+HOLDS it once acquired. The 30s is sized against that hold, not against a
+contending caller's wait: `bootstrapLockTimeout`'s own comment states
+bootstrap may hold the lock across one token refresh plus `claude auth
+status` probes. Concretely, the hold can span up to two probes
+(`authStatusTimeout`, 10s each, plus a 2s `WaitDelay` grace) and one refresh
+(the OAuth client's own 10s HTTP timeout) — each individually capped, but
+nothing bounds their sum, so the hold itself carries no fixed ceiling, 30s
+or otherwise. A lifecycle command queued behind a live bootstrap waits on
+its OWN acquire budget (`filelock.DefaultTimeout`, 10s), not on bootstrap's
+30s: its `cerr.Lock` failure arrives, and ordinarily does, before bootstrap
+releases. A reader who budgets retries against 30s — expecting a queued
+lifecycle command to clear on its own within that window — is wrong twice:
+the command does not wait 30s, it fails at 10s, and bootstrap's hold is not
+bounded by 30s to begin with. A script that runs two of these operations
+concurrently receives one success and one `cerr.Lock` failure rather than
+two successes — the correct outcome, but one a caller polling for two
+successes must account for.
+
+**(iv) Re-validation can abort an operation the user already confirmed.**
+When the slot a displacement or overwrite prompt described has changed by
+the time the locked read re-checks it, `AddAccount` / `AddAccountFromToken`
+report a `cerr.Config` refusal naming what changed rather than completing
+the confirmed action — a user who answered the prompt is told nothing
+happened and to re-run the command. This is a worse moment than the silent,
+wrong success it replaces, though never a worse outcome: nothing is
+destroyed either way, and the refusal names the slot and what now occupies
+it.
+
+**(v) The guarantee is advisory and cswap-only.** A hand edit of
+`sequence.json`, or a future tool that writes it without taking the store
+`FileLock`, is invisible to every rule in this amendment and still
+last-writer-wins against a cswap process mid-operation. RULE 1's corruption
+refusal catches an unparseable result of such an edit; it cannot catch a
+well-formed one that simply disagrees with what a concurrent cswap decided
+from.
+
+**(vi) RULE 4's locked span makes a lock order load-bearing.** `clearDeadToken` (`internal/lifecycle/lifecycle.go`),
+called from inside `AddAccount`'s and `AddAccountFromToken`'s locked
+bodies, mutates the usage store and so acquires `.usage.lock` while the
+store `FileLock` (`.lock`) is already held: every such call site now takes
+`.lock` before `.usage.lock`. Nothing in the repository takes them in the
+reverse order today — `usage.Store`'s own mutators (`internal/usage/store.go`)
+never call back into a `store.Store` method, and the usage-fetch protocol
+reads the roster, fetches over the network unlocked, then writes the
+roster, never the reverse nesting. The invariant holds by the shape of the
+code, not by enforcement; a future call from inside a usage mutator back
+into a locked store method deadlocks permanently, since neither `FileLock`
+has a nested-acquire timeout (F3, §2.8).
+
+**(vii) The three filelock facts recorded at §2.8 are measured on Linux
+only.** F2 (release on handle-close / process-death) and F3 (an in-process
+waiter on the same object ignores its own timeout) follow from `FileLock`'s
+Go-level `hold` mutex and are platform-independent by construction, so they
+carry over to the Windows `LockFileEx` path unmeasured but not unreasoned.
+F1 (two independent handles on the same file, one process, serializing
+exactly as two processes would) is asserted from `LockFileEx`'s documented
+contract, not measured — no run of this design's regression suite has
+executed on Windows.
+
+**(viii) `transfer.Import` opens its own `*filelock.FileLock` on the store's
+lock path rather than sharing `store.Store.Lock`.** Cross-process this is
+correct: two independent handles on the same file serialize at the OS
+`flock` level regardless of which process or object opened them (F1).
+In-process, it means an `Import` call and a lifecycle operation sharing one
+`*store.Store` do not queue on the fast, in-memory `hold` mutex (F3); they
+contend at the `flock` level instead, and each burns its own acquire
+budget rather than one waiting on the other's release. Nothing in the
+repository runs both in one process today, so this is a latent difference
+between two code paths that look identical, not an observed defect.
+
+**(ix) A corrupt roster's refusal now runs while the store lock is held.**
+`WithRosterLocked` classifies after acquiring the lock, so a corrupt
+`sequence.json` makes every one of these operations hold the lock for the
+few microseconds the refusal takes before releasing it. A read-only command
+that does not take the lock is unaffected; a second write-capable command
+queued behind the refusal waits only that long — no different in kind from
+waiting behind any other short-lived acquisition.

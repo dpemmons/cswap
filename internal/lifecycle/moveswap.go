@@ -4,7 +4,10 @@
 // Implements spec 01§10.3–10.5 (move_account / _relocate_locked /
 // _swap_accounts_locked). The whole resolve-validate-mutate span runs under one
 // FileLock acquisition (non-reentrant, so resolution and dispatch share it —
-// a slot resolved outside the lock could be renumbered by a concurrent move).
+// a slot resolved outside the lock could be renumbered by a concurrent move),
+// and reads the roster exactly once inside it: both entry points read (refusing
+// an unparseable sequence.json rather than treating it as no accounts) and hand
+// that roster to the locked bodies, which validate and commit the same object.
 // The sequence.json write is THE commit point: a failure before it rolls both
 // slots back (via durable 0600 O_EXCL staging copies when the backup keys
 // overlap on a same-email swap), and after it only best-effort cleanup remains.
@@ -38,16 +41,17 @@ func MoveAccount(s *store.Store, account, target string) (srcNum, tgtNum string,
 	}
 	target = strconv.Itoa(tnum) // normalize "01" -> "1"
 
-	err = s.Lock.With(func() error {
-		if _, e := s.SequenceMigrated(); e != nil {
-			return e
-		}
+	// One roster for the whole locked span (store.WithRosterLocked: the backfill,
+	// then one classified read, all inside the lock), read before resolving and
+	// handed down to relocateLocked/swapAccountsLocked. The file cannot change
+	// under the lock, so re-reading would only add ways for the branches to
+	// disagree with the validation below. Reading before resolving also runs the
+	// org backfill — which WRITES a roster — ahead of the read this span commits,
+	// so the commit carries the backfill rather than reverting it. A corrupt
+	// roster refuses before any of that, from this read or from ResolveAccount's
+	// own classified one; neither reports it as a missing account.
+	err = s.WithRosterLocked(func(data *store.SequenceData) error {
 		numSrc, _, _, e := s.ResolveAccount(account)
-		if e != nil {
-			return e
-		}
-
-		data, e := s.ReadSequence()
 		if e != nil {
 			return e
 		}
@@ -74,14 +78,14 @@ func MoveAccount(s *store.Store, account, target string) (srcNum, tgtNum string,
 			return nil
 		}
 		if _, occupied := data.Accounts[target]; occupied {
-			if _, _, e := swapAccountsLocked(s, numSrc, target); e != nil {
+			if _, _, e := swapAccountsLocked(s, data, numSrc, target); e != nil {
 				return e
 			}
 			swapped = true
 			return nil
 		}
 		swapped = false
-		return relocateLocked(s, numSrc, target)
+		return relocateLocked(s, data, numSrc, target)
 	})
 	if err != nil {
 		return "", "", false, err
@@ -95,8 +99,10 @@ func SwapAccounts(s *store.Store, first, second string) (numA, numB string, err 
 	if !sequenceFileExists(s) {
 		return "", "", cerr.Config("No accounts are managed yet")
 	}
-	err = s.Lock.With(func() error {
-		a, b, e := swapAccountsLocked(s, first, second)
+	// The backfill and the classified entry read of the locked span, in the order
+	// MoveAccount documents.
+	err = s.WithRosterLocked(func(data *store.SequenceData) error {
+		a, b, e := swapAccountsLocked(s, data, first, second)
 		numA, numB = a, b
 		return e
 	})
@@ -107,12 +113,9 @@ func SwapAccounts(s *store.Store, first, second string) (numA, numB string, err 
 }
 
 // relocateLocked moves numSrc into the empty slot target (spec 01§10.4). Caller
-// holds the FileLock.
-func relocateLocked(s *store.Store, numSrc, target string) error {
-	data, err := s.ReadSequence()
-	if err != nil {
-		return err
-	}
+// holds the FileLock and passes the roster it read under it (never nil); this
+// mutates that roster and commits it.
+func relocateLocked(s *store.Store, data *store.SequenceData, numSrc, target string) error {
 	if _, ok := recordAt(data, numSrc); !ok {
 		return cerr.AccountNotFound("Account-%s does not exist", numSrc)
 	}
@@ -186,12 +189,10 @@ func relocateLocked(s *store.Store, numSrc, target string) error {
 	return nil
 }
 
-// swapAccountsLocked is the body of SwapAccounts; caller holds the FileLock
-// (spec 01§10.5).
-func swapAccountsLocked(s *store.Store, first, second string) (string, string, error) {
-	if _, err := s.SequenceMigrated(); err != nil {
-		return "", "", err
-	}
+// swapAccountsLocked is the body of SwapAccounts; caller holds the FileLock, has
+// run the org backfill, and passes the roster it read under the lock (never
+// nil), which this mutates and commits (spec 01§10.5).
+func swapAccountsLocked(s *store.Store, data *store.SequenceData, first, second string) (string, string, error) {
 	numA, _, _, err := s.ResolveAccount(first)
 	if err != nil {
 		return "", "", swapResolveErr(err, first)
@@ -204,10 +205,6 @@ func swapAccountsLocked(s *store.Store, first, second string) (string, string, e
 		return "", "", cerr.Validation("Cannot swap an account with itself")
 	}
 
-	data, err := s.ReadSequence()
-	if err != nil {
-		return "", "", err
-	}
 	recA, okA := data.Accounts[numA]
 	recB, okB := data.Accounts[numB]
 	if !okA {

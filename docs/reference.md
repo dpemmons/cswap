@@ -744,6 +744,12 @@ Writes the `alias` field on the account's `sequence.json` record.
 | `NAME is required (or pass --unset to remove the alias)` | 2 |
 | `unrecognized arguments: <tok>` | 2 |
 | Invalid alias name (`ConfigError`) | 1 |
+| Corrupt or unreadable `sequence.json` (`ConfigError`, names the file and the repair/restart options) | 1 |
+
+A corrupt roster refuses rather than reporting `No aliases set` (list) or
+silently writing over it (set/unset): the roster's records may still be
+hand-repairable, and every account's stored credential and config backup is
+intact even though the roster naming it is not.
 
 ### Example
 
@@ -932,8 +938,13 @@ removed account prints a warning and launches the default.
 |---------|------|
 | `unrecognized arguments: <tok>` | 2 |
 | A `SessionError` / bootstrap failure (`Error: <message>`) | 1 |
+| Corrupt or unreadable `sequence.json` (`ConfigError`, names the file and the repair/restart options) | 1 |
 
 An API-key account cannot be run in session mode and is rejected.
+
+Account resolution — an explicit account, or the current directory's
+mapping — refuses on a corrupt roster; with no account argument this means
+`run` refuses rather than falling back to the default login.
 
 ### Example (illustrative — requires a real Claude Code install)
 
@@ -1024,6 +1035,11 @@ written (see Description).
 | `argument --shell: expected one argument` | 2 |
 | `unrecognized arguments: <tok>` | 2 |
 | `Nothing to prepare an environment for (...). Pass an account ..., map this directory ..., or clear a pinned profile with cswap env --unset.` | 1 |
+| Corrupt or unreadable `sequence.json` (`ConfigError`, names the file and the repair/restart options) | 1 |
+
+Account resolution (an explicit `NUM\|EMAIL\|ALIAS`, or the current
+directory's mapping) refuses on a corrupt roster rather than reporting that
+no such account exists.
 
 ### Example
 
@@ -1095,10 +1111,18 @@ Reads and writes `mappings.json` in the backup root.
 |---------|------|
 | `unrecognized arguments: <tok>` | 2 |
 | `No account found with identifier: <id>` | 1 |
+| Corrupt or unreadable `sequence.json`, given an account argument (`ConfigError`, names the file and the repair/restart options) | 1 |
 
 A non-directory path prints
 `Warning: <path> is not an existing directory (mapping it anyway)` on stdout
 and proceeds.
+
+The corrupt-roster refusal applies only when an account is given: account
+resolution refuses rather than reporting "no such account." The bare,
+no-argument listing does not detect a corrupt roster at all and exits 0 —
+every mapping prints as `... (account removed)`, whether or not the account
+it names still exists, because the listing cannot tell corruption from
+absence.
 
 ### Example
 
@@ -1434,7 +1458,10 @@ config (`--full`). `kind` and `alias` are omitted when empty.
 ### Errors
 
 Handled errors surface as `Error: <message>` (`TransferError` or a credential
-error), exit 1.
+error), exit 1. A corrupt or unreadable `sequence.json` surfaces a
+`ConfigError` naming the file and the repair/restart options instead of the
+`TransferError` an absent or empty roster reports (`no accounts to
+export — run cswap --add-account first`).
 
 ### Example
 

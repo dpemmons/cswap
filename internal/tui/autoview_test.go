@@ -18,11 +18,21 @@ import (
 
 // candAcct builds a switchable, non-active candidate carrying a trusted LastGood
 // usage map (the panel reads acc.Usage.LastGood directly, as the engine does).
+// RotationEligible tracks reporting.Snapshot's derivation (Switchable &&
+// !Disabled); parkDisabled below is the only way these fixtures diverge.
 func candAcct(number, email string, lastGood map[string]any) reporting.AccountSnapshot {
 	return reporting.AccountSnapshot{
-		Number: number, Email: email, Switchable: true,
+		Number: number, Email: email, Switchable: true, RotationEligible: true,
 		Usage: usage.UsageEntry{LastGood: lastGood},
 	}
+}
+
+// parkDisabled marks a candidate held out of rotation exactly as
+// reporting.Snapshot would: Disabled set, RotationEligible cleared.
+func parkDisabled(acc reporting.AccountSnapshot) reporting.AccountSnapshot {
+	acc.Disabled = true
+	acc.RotationEligible = false
+	return acc
 }
 
 // sevenDay builds a LastGood map whose binding window is the 7d window at pct,
@@ -58,12 +68,12 @@ func candidatesSnapshot() *reporting.AccountsSnapshot {
 	return &reporting.AccountsSnapshot{
 		ActiveNumber: "1",
 		Accounts: []reporting.AccountSnapshot{
-			candAcct("2", "acc2@x", sevenDay(40, "2026-07-20T00:00:00Z")),        // headroom, renewal 07-20
-			candAcct("3", "acc3@x", sevenDay(60, "2026-07-19T00:00:00Z")),        // headroom, renewal 07-19
-			candAcct("4", "acc4@x", sevenDay(20, "")),                            // headroom, unknown renewal
-			candAcct("5", "acc5@x", sevenDay(100, "2026-07-18T00:00:00Z")),       // at limit, renewal 07-18
-			candAcct("6", "acc6@x", sevenDay(100, "")),                           // at limit, unknown renewal
-			{Number: "7", Email: "acc7@x", Switchable: true,
+			candAcct("2", "acc2@x", sevenDay(40, "2026-07-20T00:00:00Z")),  // headroom, renewal 07-20
+			candAcct("3", "acc3@x", sevenDay(60, "2026-07-19T00:00:00Z")),  // headroom, renewal 07-19
+			candAcct("4", "acc4@x", sevenDay(20, "")),                      // headroom, unknown renewal
+			candAcct("5", "acc5@x", sevenDay(100, "2026-07-18T00:00:00Z")), // at limit, renewal 07-18
+			candAcct("6", "acc6@x", sevenDay(100, "")),                     // at limit, unknown renewal
+			{Number: "7", Email: "acc7@x", Switchable: true, RotationEligible: true,
 				Usage: usage.UsageEntry{Sentinel: "token expired"}}, // sentinel
 			candAcct("8", "acc8@x", nil), // usage unknown
 		},
@@ -113,7 +123,7 @@ func TestCandidatesTextSoonestResetThresholdTier(t *testing.T) {
 			// at limit -> tier 3.
 			candAcct("5", "acc5@x", sevenDay(100, "2026-07-19T00:00:00Z")),
 			// sentinel -> tier 4.
-			{Number: "6", Email: "acc6@x", Switchable: true,
+			{Number: "6", Email: "acc6@x", Switchable: true, RotationEligible: true,
 				Usage: usage.UsageEntry{Sentinel: "token expired"}},
 			// usage unknown -> tier 5.
 			candAcct("7", "acc7@x", nil),
@@ -128,14 +138,13 @@ func TestCandidatesTextSoonestResetThresholdTier(t *testing.T) {
 // TestCandidatesTextExcludesDisabled fixes DESIGN A18: a disabled account is
 // excluded from the panel entirely, even when its usage would make it the single
 // strongest candidate. The engine's candidate set drops disabled accounts
-// (store SwitchableAccountNumbers = AccountIsSwitchable && !disabled), so ranking
-// one would let the displayed order disagree with every pick. The enabled
+// (store.RotationEligible = AccountIsSwitchable && !disabled), so ranking one
+// would let the displayed order disagree with every pick. The enabled
 // candidates must still rank correctly under both strategies.
 func TestCandidatesTextExcludesDisabled(t *testing.T) {
 	// The disabled account has the best usage of all (lowest pct + earliest
 	// renewal), so it would top the ranking under either strategy if included.
-	disabled := candAcct("2", "disabled@x", sevenDay(5, "2026-07-17T00:00:00Z"))
-	disabled.Disabled = true
+	disabled := parkDisabled(candAcct("2", "disabled@x", sevenDay(5, "2026-07-17T00:00:00Z")))
 	snap := &reporting.AccountsSnapshot{
 		ActiveNumber: "1",
 		Accounts: []reporting.AccountSnapshot{
@@ -168,6 +177,36 @@ func TestCandidatesTextExcludesDisabled(t *testing.T) {
 	}
 }
 
+// TestCandidatesTextConsumesRotationEligible fixes that the panel reads the
+// snapshot's single derived field and never re-ANDs Switchable/Disabled itself
+// (DESIGN A18): a row the producer marked ineligible is dropped no matter how its
+// component fields read, and a row with no stored creds/config stays dropped.
+func TestCandidatesTextConsumesRotationEligible(t *testing.T) {
+	// Both rejects carry the best usage of all, so either would top the ranking.
+	ineligible := candAcct("2", "ineligible@x", sevenDay(5, "2026-07-17T00:00:00Z"))
+	ineligible.RotationEligible = false // producer's verdict; components unchanged
+	unswitchable := candAcct("3", "unswitchable@x", sevenDay(5, "2026-07-17T00:00:00Z"))
+	unswitchable.Switchable, unswitchable.RotationEligible = false, false
+	snap := &reporting.AccountsSnapshot{
+		ActiveNumber: "1",
+		Accounts: []reporting.AccountSnapshot{
+			ineligible, unswitchable,
+			candAcct("4", "acc4@x", sevenDay(40, "2026-07-20T00:00:00Z")),
+		},
+	}
+	a := newAutoScreen()
+	a.settings = settings.Default()
+	out := a.candidatesText(snap).plain()
+	for _, email := range []string{"ineligible@x", "unswitchable@x"} {
+		if strings.Contains(out, email) {
+			t.Fatalf("%s is not rotation-eligible and must not appear in the panel:\n%s", email, out)
+		}
+	}
+	if !strings.Contains(out, "acc4@x") {
+		t.Fatalf("the eligible candidate must still be ranked:\n%s", out)
+	}
+}
+
 // writeAutoState writes a raw autoswitch_state.json body into a backup dir at
 // the path the engine (and the panel's reader) targets.
 func writeAutoState(t *testing.T, dir, body string) {
@@ -194,7 +233,7 @@ func TestCandidatesTextMarksQuarantined(t *testing.T) {
 			candAcct("2", "acc2@x", sevenDay(5, "2026-07-17T00:00:00Z")),   // BEST usage, quarantined
 			candAcct("3", "acc3@x", sevenDay(30, "2026-07-25T00:00:00Z")),  // viable, below threshold
 			candAcct("6", "acc6@x", sevenDay(100, "2026-07-19T00:00:00Z")), // at limit
-			{Number: "7", Email: "acc7@x", Switchable: true,
+			{Number: "7", Email: "acc7@x", Switchable: true, RotationEligible: true,
 				Usage: usage.UsageEntry{Sentinel: "token expired"}}, // sentinel
 			candAcct("8", "acc8@x", nil), // usage unknown
 		},

@@ -6,6 +6,23 @@
 // the kind-specific credential payload and the shared config blob (org fields
 // JSON null in the blob but "" in the sequence record — §6.4/§6.6), refresh-in-
 // place, and new/slotted add with displace/migrate.
+//
+// The roster discipline mirrors add.go: ONE read, taken inside the store
+// FileLock through store.WithRosterLocked (absent → an empty roster; present but
+// unparseable → refuse rather than overwrite records whose backups nothing else
+// names). That single roster decides the placeholder email's slot, the
+// auto-assigned slot and the cross-kind collision check, and is the object every
+// WriteSequence below commits — nothing re-fetches it mid-flight, so no two of
+// those decisions can answer from different rosters, and no other cswap can
+// commit between the read and the writes for this call's commit to erase.
+//
+// The overwrite confirmation is asked before the lock and its premise
+// re-validated inside it (add.go's confirmDisplacement / revalidateDisplacement,
+// shared verbatim). Token acquisition — a getpass prompt or a stdin read — also
+// stays outside: it happens before any store work at all. The cross-kind
+// collision is the one guard answered twice: once before that question, so a
+// refusal never arrives after the user has authorized destroying a slot, and
+// once inside the locked span, which is the answer that binds.
 package lifecycle
 
 import (
@@ -50,12 +67,6 @@ func AddAccountFromToken(s *store.Store, token string, email, slotArg *string, a
 	if err := s.SetupDirectories(); err != nil {
 		return err
 	}
-	if err := s.InitSequenceFile(); err != nil {
-		return err
-	}
-	if _, err := s.SequenceMigrated(); err != nil {
-		return err
-	}
 
 	// slot resolution (Python slot is int|None).
 	var slotPtr *int
@@ -66,176 +77,188 @@ func AddAccountFromToken(s *store.Store, token string, email, slotArg *string, a
 		}
 		slotPtr = &n
 	}
+	// A pure argument check, settled before anything is asked: the locked body
+	// rejects it too, but prompting first would ask the user to authorize
+	// overwriting a slot the command is about to refuse.
+	if slotPtr != nil && *slotPtr < 1 {
+		return cerr.Config("Slot number must be >= 1")
+	}
 
-	// Email defaulting (§6.2): note this may assign slotPtr for the placeholder.
-	if emailVal == "" {
-		if slotPtr == nil {
-			n := s.NextAccountNumber()
-			slotPtr = &n
+	// The confirmation, outside the lock the commit below holds. Whenever a slot
+	// was named the identity being added is known without the roster — an
+	// explicit --email, or the §6.2 placeholder, which is a pure function of that
+	// slot number. The roster-derived placeholder belongs to the no-slot path,
+	// where the question is unreachable.
+	confirmEmail := emailVal
+	if confirmEmail == "" && slotPtr != nil {
+		confirmEmail = tokenPlaceholderEmail(isAPIKey, *slotPtr)
+	}
+
+	// The cross-kind collision is settled BEFORE the question is asked. Once it
+	// holds the add can never succeed, so prompting first would ask the user to
+	// authorize destroying a slot's occupant for an outcome that is already
+	// refused. This answer is advisory only — the roster can change between here
+	// and the commit span — so it fails fast and nothing more; the check inside
+	// the locked span below is the guarantee. It runs exactly where a question
+	// can be asked (confirmDisplacement's own precondition: a named slot, no
+	// assume-yes), which is also where the identity is known without consulting
+	// the roster.
+	if slotPtr != nil && !assumeYes {
+		if err := rejectCrossKindCollisionEarly(s, confirmEmail, isAPIKey); err != nil {
+			return err
 		}
-		label := "setup-token"
+	}
+
+	confirmed, cancelled, err := confirmDisplacement(s, slotPtr, assumeYes, confirmEmail, "")
+	if err != nil || cancelled {
+		return err
+	}
+
+	return s.WithRosterLocked(func(data *store.SequenceData) error {
+		// Email defaulting (§6.2): note this may assign slotPtr for the
+		// placeholder, from the roster this call commits.
+		if emailVal == "" {
+			if slotPtr == nil {
+				n := s.NextAccountNumberFrom(data)
+				slotPtr = &n
+			}
+			emailVal = tokenPlaceholderEmail(isAPIKey, *slotPtr)
+		}
+
+		if err := rejectCrossKindCollision(s, data, emailVal, isAPIKey); err != nil {
+			return err
+		}
+
+		var credentials string
 		if isAPIKey {
-			label = "api-key"
+			credentials = token // raw key stored verbatim.
+		} else {
+			credentials = setupTokenCredentials(token)
 		}
-		emailVal = fmt.Sprintf("%s-%d@token.local", label, *slotPtr)
-	}
+		config := tokenConfigBlob(emailVal)
 
-	if err := rejectCrossKindCollision(s, emailVal, isAPIKey); err != nil {
-		return err
-	}
-
-	var credentials string
-	if isAPIKey {
-		credentials = token // raw key stored verbatim.
-	} else {
-		credentials = setupTokenCredentials(token)
-	}
-	config := tokenConfigBlob(emailVal)
-
-	data, err := s.ReadSequence()
-	if err != nil {
-		return err
-	}
-	if data == nil {
-		data = emptySequence(s)
-	}
-
-	// Refresh-in-place (§6.5): no slot and identity (email, "") exists.
-	if slotPtr == nil {
-		if accountNum := s.FindAccountSlot(data, emailVal, ""); accountNum != "" {
-			return addTokenRefreshInPlace(s, data, accountNum, emailVal, credentials, config, isAPIKey)
-		}
-	}
-
-	var (
-		accountNum   string
-		displaceSlot *displaceInfo
-		migrateFrom  string
-	)
-
-	if slotPtr != nil {
-		if *slotPtr < 1 {
-			return cerr.Config("Slot number must be >= 1")
-		}
-		accountNum = strconv.Itoa(*slotPtr)
-
-		if old := s.FindAccountSlot(data, emailVal, ""); old != "" && old != accountNum {
-			migrateFrom = old
-		}
-
-		if rec, present := recordAt(data, accountNum); present {
-			existingEmail := rec.str("email")
-			existingOrg := rec.str("organizationUuid")
-			if !(existingEmail == emailVal && existingOrg == "") {
-				existingTag := displayTag(rec.str("organizationName"))
-				emitWarning(fmt.Sprintf("Slot %d already occupied", *slotPtr))
-				emitLine(existingEmail + " " + printer.Muted("["+existingTag+"]"))
-				if !assumeYes {
-					answer, gotInput := ActivePrompter.Prompt(fmt.Sprintf("Overwrite slot %d? [y/N] ", *slotPtr))
-					if !gotInput {
-						emitLine("\n" + printer.Dimmed("Cancelled"))
-						return nil
-					}
-					a := trimLower(answer)
-					if a != "y" && a != "yes" {
-						emitLine(printer.Dimmed("Cancelled"))
-						return nil
-					}
-				}
-				displaceSlot = &displaceInfo{num: accountNum, email: existingEmail, org: existingOrg}
+		// Refresh-in-place (§6.5): no slot and identity (email, "") exists.
+		if slotPtr == nil {
+			if accountNum := s.FindAccountSlot(data, emailVal, ""); accountNum != "" {
+				return addTokenRefreshInPlace(s, data, accountNum, emailVal, credentials, config, isAPIKey)
 			}
 		}
-	} else {
-		accountNum = strconv.Itoa(s.NextAccountNumber())
-	}
 
-	if displaceSlot != nil {
-		if err := s.DeleteAccountFiles(displaceSlot.num, displaceSlot.email); err != nil {
+		var (
+			accountNum   string
+			displaceSlot *displaceInfo
+			migrateFrom  string
+		)
+
+		if slotPtr != nil {
+			if *slotPtr < 1 {
+				return cerr.Config("Slot number must be >= 1")
+			}
+			accountNum = strconv.Itoa(*slotPtr)
+
+			if old := s.FindAccountSlot(data, emailVal, ""); old != "" && old != accountNum {
+				migrateFrom = old
+			}
+
+			d, err := revalidateDisplacement(data, accountNum, emailVal, "", confirmed, assumeYes)
+			if err != nil {
+				return err
+			}
+			displaceSlot = d
+		} else {
+			accountNum = strconv.Itoa(s.NextAccountNumberFrom(data))
+		}
+
+		// Each branch mutates and commits the locked roster: the occupancy it was
+		// decided from is the occupancy it is written into.
+		if displaceSlot != nil {
+			if err := s.DeleteAccountFiles(displaceSlot.num, displaceSlot.email); err != nil {
+				return err
+			}
+			if n, ok := parseSlot(displaceSlot.num); ok {
+				data.Sequence = removeInt(data.Sequence, n)
+			}
+			delete(data.Accounts, displaceSlot.num)
+			if err := s.WriteSequence(data); err != nil {
+				return err
+			}
+			pruneMappings(s, displaceSlot.email, displaceSlot.org)
+		}
+
+		if migrateFrom != "" {
+			rec, _ := recordAt(data, migrateFrom)
+			oldEmail := ""
+			if rec != nil {
+				oldEmail = rec.str("email")
+			}
+			if err := s.DeleteAccountFiles(migrateFrom, oldEmail); err != nil {
+				return err
+			}
+			if n, ok := parseSlot(migrateFrom); ok {
+				data.Sequence = removeInt(data.Sequence, n)
+			}
+			delete(data.Accounts, migrateFrom)
+			if err := s.WriteSequence(data); err != nil {
+				return err
+			}
+		}
+
+		if err := s.WriteAccountCredentials(accountNum, emailVal, credentials); err != nil {
 			return err
 		}
-		data, err = s.ReadSequence()
-		if err != nil {
+		if err := s.WriteAccountConfig(accountNum, emailVal, config); err != nil {
 			return err
 		}
-		if n, ok := parseSlot(displaceSlot.num); ok {
-			data.Sequence = removeInt(data.Sequence, n)
+		clearDeadToken(s, accountNum, emailVal, "")
+
+		rec := newRecord()
+		rec.set("email", emailVal)
+		rec.set("uuid", "")
+		rec.set("organizationUuid", "")
+		rec.set("organizationName", "")
+		rec.set("added", timestamp(s))
+		if isAPIKey {
+			rec.set("kind", "api_key")
 		}
-		delete(data.Accounts, displaceSlot.num)
+		if err := putRecord(data, accountNum, rec); err != nil {
+			return err
+		}
+		slotInt, _ := parseSlot(accountNum)
+		if !containsInt(data.Sequence, slotInt) {
+			data.Sequence = append(data.Sequence, slotInt)
+			sort.Ints(data.Sequence)
+		}
+		data.LastUpdated = timestamp(s)
 		if err := s.WriteSequence(data); err != nil {
 			return err
 		}
-		pruneMappings(s, displaceSlot.email, displaceSlot.org)
-	}
 
-	if migrateFrom != "" {
-		data, err = s.ReadSequence()
-		if err != nil {
-			return err
+		sourceLabel := "token"
+		if isAPIKey {
+			sourceLabel = "API key"
 		}
-		rec, _ := recordAt(data, migrateFrom)
-		oldEmail := ""
-		if rec != nil {
-			oldEmail = rec.str("email")
+		if s.Log != nil {
+			s.Log.Infof("Added account %s from %s: %s", accountNum, sourceLabel, emailVal)
 		}
-		if err := s.DeleteAccountFiles(migrateFrom, oldEmail); err != nil {
-			return err
+		if migrateFrom != "" {
+			emitLine(printer.Dimmed(fmt.Sprintf("Moved from slot %s → %s", migrateFrom, accountNum)))
 		}
-		if n, ok := parseSlot(migrateFrom); ok {
-			data.Sequence = removeInt(data.Sequence, n)
-		}
-		delete(data.Accounts, migrateFrom)
-		if err := s.WriteSequence(data); err != nil {
-			return err
-		}
-	}
+		emitLine(printer.Accent("Added") + " Account " + accountNum + ": " + emailVal + " " +
+			printer.Muted("[personal]") + " " + printer.Muted("(from "+sourceLabel+")"))
+		return nil
+	})
+}
 
-	if err := s.WriteAccountCredentials(accountNum, emailVal, credentials); err != nil {
-		return err
-	}
-	if err := s.WriteAccountConfig(accountNum, emailVal, config); err != nil {
-		return err
-	}
-	clearDeadToken(s, accountNum, emailVal, "")
-
-	data, err = s.ReadSequence()
-	if err != nil {
-		return err
-	}
-	rec := newRecord()
-	rec.set("email", emailVal)
-	rec.set("uuid", "")
-	rec.set("organizationUuid", "")
-	rec.set("organizationName", "")
-	rec.set("added", timestamp(s))
+// tokenPlaceholderEmail is the §6.2 default identity for a token account added
+// with no --email: <label>-<slot>@token.local. It is a pure function of the slot
+// and the token kind, which is what lets the overwrite confirmation run before
+// the roster read on the --slot path.
+func tokenPlaceholderEmail(isAPIKey bool, slot int) string {
+	label := "setup-token"
 	if isAPIKey {
-		rec.set("kind", "api_key")
+		label = "api-key"
 	}
-	if err := putRecord(data, accountNum, rec); err != nil {
-		return err
-	}
-	slotInt, _ := parseSlot(accountNum)
-	if !containsInt(data.Sequence, slotInt) {
-		data.Sequence = append(data.Sequence, slotInt)
-		sort.Ints(data.Sequence)
-	}
-	data.LastUpdated = timestamp(s)
-	if err := s.WriteSequence(data); err != nil {
-		return err
-	}
-
-	sourceLabel := "token"
-	if isAPIKey {
-		sourceLabel = "API key"
-	}
-	if s.Log != nil {
-		s.Log.Infof("Added account %s from %s: %s", accountNum, sourceLabel, emailVal)
-	}
-	if migrateFrom != "" {
-		emitLine(printer.Dimmed(fmt.Sprintf("Moved from slot %s → %s", migrateFrom, accountNum)))
-	}
-	emitLine(printer.Accent("Added") + " Account " + accountNum + ": " + emailVal + " " +
-		printer.Muted("[personal]") + " " + printer.Muted("(from "+sourceLabel+")"))
-	return nil
+	return fmt.Sprintf("%s-%d@token.local", label, slot)
 }
 
 // addTokenRefreshInPlace is spec 01§6.5.
@@ -265,17 +288,41 @@ func addTokenRefreshInPlace(s *store.Store, data *store.SequenceData, accountNum
 	return nil
 }
 
-// rejectCrossKindCollision is _reject_cross_kind_collision (spec 01§6.3).
-func rejectCrossKindCollision(s *store.Store, email string, isAPIKey bool) error {
-	data, err := s.ReadSequence()
-	if err != nil || data == nil {
+// rejectCrossKindCollisionEarly answers §6.3 ahead of the overwrite question,
+// against a roster of its own. That roster is read the way every other advisory
+// occupancy read is — classified and backfilled, under a lock it does not hold
+// across the question — because the guard matches on the composite identity
+// (email, organizationUuid): on a pre-v0.6.0 roster an un-backfilled record's
+// absent org field would make this read match slots the locked check does not,
+// and a fail-fast that disagrees with the guarantee refuses adds that are legal.
+func rejectCrossKindCollisionEarly(s *store.Store, email string, isAPIKey bool) error {
+	var advisory *store.SequenceData
+	if err := s.WithRosterLocked(func(data *store.SequenceData) error {
+		advisory = data
+		return nil
+	}); err != nil {
 		return err
 	}
+	return rejectCrossKindCollision(s, advisory, email, isAPIKey)
+}
+
+// rejectCrossKindCollision is _reject_cross_kind_collision (spec 01§6.3): the
+// guard that keeps an OAuth token from landing on an API-key slot, or the
+// reverse. It answers from the caller's entry roster — the same roster the
+// refresh-in-place lookup and the record write use — so the slot it inspects for
+// a kind and the slot the caller would then overwrite are always the same slot.
+func rejectCrossKindCollision(s *store.Store, data *store.SequenceData, email string, isAPIKey bool) error {
 	slot := s.FindAccountSlot(data, email, "")
 	if slot == "" {
 		return nil
 	}
-	existingKind := s.AccountKindFor(slot)
+	// The kind comes from that roster's own record, not from store.AccountKindFor
+	// — that reads the file again, and a slot whose kind is read from one roster
+	// and overwritten in another is the collision this guard exists to prevent.
+	existingKind := "oauth"
+	if rec, ok := recordAt(data, slot); ok && rec.str("kind") == "api_key" {
+		existingKind = "api_key"
+	}
 	newKind := "oauth"
 	if isAPIKey {
 		newKind = "api_key"

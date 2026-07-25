@@ -8,7 +8,20 @@
 // (--force) / freshly-allocating a slot on the composite (email, organizationUuid)
 // identity, clearing any dead-token quarantine on every successful write, and
 // seeding activeAccountNumber only into a destination with no prior preference.
-// Per DESIGN Deviation 9 the whole pass-2 write span runs under one FileLock.
+//
+// Per DESIGN Deviation 9 the whole span from the roster read through the last
+// write runs under one FileLock. The local roster is read ONCE, classified
+// (MigratedSequenceForUpdate), INSIDE that lock: an absent sequence.json is a
+// fresh install and yields an empty roster, while one that is there but
+// unreadable refuses before anything is written, since an empty roster
+// substituted there would be renamed over every record whose backups this
+// import does not carry. That single roster is then threaded through the alias
+// check, every slot decision, and every write, so no record can land in a roster
+// other than the one its slot was chosen against — and because the read is
+// inside the lock, that roster is also the bytes on disk: a second cswap cannot
+// commit between the read and the writes, so its records cannot be renamed away
+// by this import's own commit. Only the envelope read (which may drain stdin)
+// stays outside.
 package transfer
 
 import (
@@ -19,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/cerr"
 	"git.dpemmons.com/dpemmons/cswap/internal/credstore"
@@ -28,6 +42,11 @@ import (
 // Stdin is the source for "-"/stdin imports (transfer.py::sys.stdin.read). Tests
 // redirect it; production leaves it at os.Stdin.
 var Stdin io.Reader = os.Stdin
+
+// importLockTimeout is the acquire budget for the write-pass lock. Zero means
+// filelock's default (10s), which is what production uses; tests shorten it to
+// reach the contention path without waiting out the real budget.
+var importLockTimeout time.Duration
 
 // normalizedEntry is one validated account ready for pass 2. creds_text is the
 // raw API-key string or the compact-JSON OAuth object; config_text is the
@@ -84,146 +103,147 @@ func Import(acc Accounts, source string, force bool) error {
 	// byte-identical to Python and to Go's add-token path.
 	rawCreds := rawCredentialsBytes(text)
 
-	// Pass 1 — validate everything before any write.
-	localData, err := acc.MigratedSequence()
-	if err != nil {
-		return err
-	}
-	localAliases := localAliasOwners(localData)
-
-	var normalized []normalizedEntry
-	seenKeys := map[[2]string]bool{}
-	seenAliases := map[string]bool{}
-	for i, raw := range accountsRaw {
-		email, exportedNum, err := validateImportedAccount(raw)
-		if err != nil {
-			return err
-		}
-		m, _ := asObject(raw)
-		orgUUID := strOrEmpty(m["organizationUuid"])
-		credsObj := m["credentials"]
-		configObj, ok := asObject(m["config"])
-		if !ok {
-			return cerr.Transfer("config for %s must be a JSON object", email)
-		}
-
-		_, credsIsString := credsObj.(string)
-		isAPIKey := m["kind"] == "api_key" || credsIsString
-		var credsText string
-		if isAPIKey {
-			s, isStr := credsObj.(string)
-			if !isStr || !credstore.LooksLikeAPIKey(s) {
-				return cerr.Transfer("API-key credentials for %s must be a raw sk-ant-api… string", email)
-			}
-			credsText = strings.TrimSpace(s)
-		} else {
-			obj, ok := asObject(credsObj)
-			if !ok {
-				return cerr.Transfer("credentials for %s must be a JSON object", email)
-			}
-			// Prefer the order-preserving raw bytes (Python json.dumps parity);
-			// fall back to the decoded map only if the parallel parse desynced,
-			// which cannot happen for the same text — this is purely defensive.
-			var b []byte
-			if i < len(rawCreds) && len(rawCreds[i]) > 0 {
-				b, err = marshalSpacedNoHTML(rawCreds[i])
-			} else {
-				b, err = marshalNoHTML(obj)
-			}
-			if err != nil {
-				return err
-			}
-			credsText = string(b)
-		}
-
-		key := [2]string{email, orgUUID}
-		if seenKeys[key] {
-			return cerr.Transfer("duplicate account in export: %s (org=%s)", email, orgOrPersonal(orgUUID))
-		}
-		seenKeys[key] = true
-
-		alias := ""
-		if aliasStr := strOrEmpty(m["alias"]); aliasStr != "" {
-			aliasKey, err := normalizeAlias(aliasStr) // already format-validated in pass 1
-			if err != nil {
-				return cerr.Transfer("invalid alias for %s: %s", email, err.Error())
-			}
-			if seenAliases[aliasKey] {
-				return cerr.Transfer("duplicate alias in export: %s", aliasKey)
-			}
-			seenAliases[aliasKey] = true
-			if owner, ok := localAliases[aliasKey]; ok && owner != key {
-				eprint("Warning: alias '" + aliasKey + "' for " + email + " already used by an " +
-					"existing account, dropping the imported alias")
-			} else {
-				alias = aliasKey
-			}
-		}
-
-		added := strOrEmpty(m["added"])
-		if added == "" {
-			added = acc.Timestamp()
-		}
-		kind := "oauth"
-		if isAPIKey {
-			kind = "api_key"
-		}
-		configBytes, err := marshalIndent2NoHTML(configObj)
-		if err != nil {
-			return err
-		}
-		normalized = append(normalized, normalizedEntry{
-			email:       email,
-			exportedNum: exportedNum,
-			orgUUID:     orgUUID,
-			orgName:     strOrEmpty(m["organizationName"]),
-			uuid:        strOrEmpty(m["uuid"]),
-			added:       added,
-			kind:        kind,
-			alias:       alias,
-			credsText:   credsText,
-			configText:  string(configBytes),
-		})
-	}
-
-	// Pass 2 — writes. Fresh $HOME self-bootstraps here.
-	if err := acc.SetupDirectories(); err != nil {
-		return err
-	}
-	if err := acc.InitSequenceFile(); err != nil {
-		return err
-	}
-
-	envelopeActiveStr := ""
-	if v, ok := intValue(envelope["activeAccountNumber"]); ok {
-		envelopeActiveStr = strconv.Itoa(v)
-	}
-
-	var imported, skipped, overwritten int
+	var (
+		data                           *SequenceData
+		imported, skipped, overwritten int
+	)
 	writtenSlots := map[string]bool{}
-	resolvedActiveSlot := ""
-	var final *SequenceData
 
-	// DESIGN Deviation 9: the whole write pass (per-account writes + activeAccount
-	// seeding) runs under one FileLock — a hardening over Python's unlocked RMW.
-	// None of the callees re-acquire this lock, so non-reentrancy holds.
-	lock := filelock.New(filepath.Join(acc.BackupDir(), ".lock"), 0)
+	// DESIGN Deviation 9: the classified roster read, pass 1, the bootstrap and
+	// the whole write pass run under ONE FileLock — a hardening over Python's
+	// unlocked RMW. The read has to be inside it, not merely the writes: a roster
+	// read before the lock is a roster another cswap can commit over while this
+	// import waits for the lock, and this import's own commit would then rename a
+	// file built from the pre-lock roster over that record. None of the callees
+	// re-acquire this lock (they are the non-locking store primitives; the usage
+	// store's dead-token clear takes a different file), so non-reentrancy holds.
+	// filelock.Acquire creates its own parent directory, so a fresh $HOME reaches
+	// SetupDirectories from inside the lock.
+	lock := filelock.New(filepath.Join(acc.BackupDir(), ".lock"), importLockTimeout)
 	writeErr := lock.With(func() error {
-		for _, entry := range normalized {
-			isEnvelopeActive := envelopeActiveStr != "" && entry.exportedNum == envelopeActiveStr
+		// Pass 1 — validate everything before any write. This classified read is
+		// the operation's ONE roster read: the same in-memory roster answers the
+		// alias collision check here, every slot decision in pass 2, and every
+		// write, so no write can land in a roster other than the one it was
+		// planned against.
+		var err error
+		data, err = rosterForUpdate(acc)
+		if err != nil {
+			return err
+		}
+		localAliases := localAliasOwners(data)
 
-			data, err := acc.MigratedSequence()
+		var normalized []normalizedEntry
+		seenKeys := map[[2]string]bool{}
+		seenAliases := map[string]bool{}
+		for i, raw := range accountsRaw {
+			email, exportedNum, err := validateImportedAccount(raw)
 			if err != nil {
 				return err
 			}
-			if data == nil {
-				data = &SequenceData{
-					ActiveAccountNumber: nil,
-					LastUpdated:         acc.Timestamp(),
-					Sequence:            []int{},
-					Accounts:            map[string]json.RawMessage{},
+			m, _ := asObject(raw)
+			orgUUID := strOrEmpty(m["organizationUuid"])
+			credsObj := m["credentials"]
+			configObj, ok := asObject(m["config"])
+			if !ok {
+				return cerr.Transfer("config for %s must be a JSON object", email)
+			}
+
+			_, credsIsString := credsObj.(string)
+			isAPIKey := m["kind"] == "api_key" || credsIsString
+			var credsText string
+			if isAPIKey {
+				s, isStr := credsObj.(string)
+				if !isStr || !credstore.LooksLikeAPIKey(s) {
+					return cerr.Transfer("API-key credentials for %s must be a raw sk-ant-api… string", email)
+				}
+				credsText = strings.TrimSpace(s)
+			} else {
+				obj, ok := asObject(credsObj)
+				if !ok {
+					return cerr.Transfer("credentials for %s must be a JSON object", email)
+				}
+				// Prefer the order-preserving raw bytes (Python json.dumps parity);
+				// fall back to the decoded map only if the parallel parse desynced,
+				// which cannot happen for the same text — this is purely defensive.
+				var b []byte
+				if i < len(rawCreds) && len(rawCreds[i]) > 0 {
+					b, err = marshalSpacedNoHTML(rawCreds[i])
+				} else {
+					b, err = marshalNoHTML(obj)
+				}
+				if err != nil {
+					return err
+				}
+				credsText = string(b)
+			}
+
+			key := [2]string{email, orgUUID}
+			if seenKeys[key] {
+				return cerr.Transfer("duplicate account in export: %s (org=%s)", email, orgOrPersonal(orgUUID))
+			}
+			seenKeys[key] = true
+
+			alias := ""
+			if aliasStr := strOrEmpty(m["alias"]); aliasStr != "" {
+				aliasKey, err := normalizeAlias(aliasStr) // already format-validated in pass 1
+				if err != nil {
+					return cerr.Transfer("invalid alias for %s: %s", email, err.Error())
+				}
+				if seenAliases[aliasKey] {
+					return cerr.Transfer("duplicate alias in export: %s", aliasKey)
+				}
+				seenAliases[aliasKey] = true
+				if owner, ok := localAliases[aliasKey]; ok && owner != key {
+					eprint("Warning: alias '" + aliasKey + "' for " + email + " already used by an " +
+						"existing account, dropping the imported alias")
+				} else {
+					alias = aliasKey
 				}
 			}
+
+			added := strOrEmpty(m["added"])
+			if added == "" {
+				added = acc.Timestamp()
+			}
+			kind := "oauth"
+			if isAPIKey {
+				kind = "api_key"
+			}
+			configBytes, err := marshalIndent2NoHTML(configObj)
+			if err != nil {
+				return err
+			}
+			normalized = append(normalized, normalizedEntry{
+				email:       email,
+				exportedNum: exportedNum,
+				orgUUID:     orgUUID,
+				orgName:     strOrEmpty(m["organizationName"]),
+				uuid:        strOrEmpty(m["uuid"]),
+				added:       added,
+				kind:        kind,
+				alias:       alias,
+				credsText:   credsText,
+				configText:  string(configBytes),
+			})
+		}
+
+		// Pass 2 — writes. Fresh $HOME self-bootstraps here.
+		if err := acc.SetupDirectories(); err != nil {
+			return err
+		}
+		if err := acc.InitSequenceFile(); err != nil {
+			return err
+		}
+
+		envelopeActiveStr := ""
+		if v, ok := intValue(envelope["activeAccountNumber"]); ok {
+			envelopeActiveStr = strconv.Itoa(v)
+		}
+		resolvedActiveSlot := ""
+
+		for _, entry := range normalized {
+			isEnvelopeActive := envelopeActiveStr != "" && entry.exportedNum == envelopeActiveStr
 
 			existingSlot := findAccountSlot(data, entry.email, entry.orgUUID)
 
@@ -270,12 +290,6 @@ func Import(acc Accounts, source string, force bool) error {
 				return err
 			}
 
-			if data.Accounts == nil {
-				data.Accounts = map[string]json.RawMessage{}
-			}
-			if data.Sequence == nil {
-				data.Sequence = []int{}
-			}
 			rec, err := buildRecord(entry.email, entry.uuid, entry.orgUUID, entry.orgName,
 				entry.added, entry.kind, entry.alias)
 			if err != nil {
@@ -306,17 +320,15 @@ func Import(acc Accounts, source string, force bool) error {
 		}
 
 		// Seed activeAccountNumber only when the destination had no prior
-		// preference (None or the literal 0), from the *resolved* local slot.
-		final, err = acc.Sequence()
-		if err != nil {
-			return err
-		}
-		if final != nil && (final.ActiveAccountNumber == nil || *final.ActiveAccountNumber == 0) &&
+		// preference (None or the literal 0), from the *resolved* local slot. The
+		// roster in hand is the one every write above went out with, so it needs
+		// no re-read to be current.
+		if (data.ActiveAccountNumber == nil || *data.ActiveAccountNumber == 0) &&
 			resolvedActiveSlot != "" {
 			n, _ := strconv.Atoi(resolvedActiveSlot)
-			final.ActiveAccountNumber = &n
-			final.LastUpdated = acc.Timestamp()
-			if err := acc.WriteSequence(final); err != nil {
+			data.ActiveAccountNumber = &n
+			data.LastUpdated = acc.Timestamp()
+			if err := acc.WriteSequence(data); err != nil {
 				return err
 			}
 		}
@@ -332,13 +344,36 @@ func Import(acc Accounts, source string, force bool) error {
 	// If we just rewrote the backup of the currently-live login, a plain switch
 	// would back the stale live creds up over it (issue #79) — point at the
 	// explicit --switch-to <slot> --force activation path instead.
-	if email, org, ok := acc.CurrentAccount(); ok && final != nil {
-		if liveSlot := findAccountSlot(final, email, org); liveSlot != "" && writtenSlots[liveSlot] {
+	if email, org, ok := acc.CurrentAccount(); ok {
+		if liveSlot := findAccountSlot(data, email, org); liveSlot != "" && writtenSlots[liveSlot] {
 			eprint("Note: " + email + " is your current live login — activate the " +
 				"imported credentials with: cswap --switch-to " + liveSlot + " --force")
 		}
 	}
 	return nil
+}
+
+// rosterForUpdate is the classified entry read for the import write pass, plus
+// the two invariants this side of the Accounts seam cannot see enforced: a
+// roster is always returned (never nil — a nil one here would make the writes
+// build a fresh file over records this operation never saw, exactly what the
+// refusal exists to prevent), and its containers are never nil, since the write
+// pass assigns into Accounts and appends to Sequence.
+func rosterForUpdate(acc Accounts) (*SequenceData, error) {
+	data, err := acc.MigratedSequenceForUpdate()
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, cerr.Config("the local account roster could not be read — refusing to import over it")
+	}
+	if data.Accounts == nil {
+		data.Accounts = map[string]json.RawMessage{}
+	}
+	if data.Sequence == nil {
+		data.Sequence = []int{}
+	}
+	return data, nil
 }
 
 // readSource reads the import text from stdin ("-") or a file (spec 07§3.1).

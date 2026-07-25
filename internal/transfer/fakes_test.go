@@ -45,6 +45,8 @@ type fakeAccounts struct {
 	writeCredsErr  error
 	writeConfigErr error
 	clearErr       error
+	seqUpdateErr   error // the classified entry read refuses (corrupt roster)
+	seqUpdateNil   bool  // the classified entry read breaks its non-nil contract
 
 	// observation
 	writtenCreds  []credWrite
@@ -53,6 +55,9 @@ type fakeAccounts struct {
 	setupCalled   bool
 	initCalled    bool
 	writeSeqCount int
+	// roster-read counts, per method: an operation that may write reads the
+	// roster once, through the classified read, and threads it.
+	entryReads, migratedReads, plainReads int
 }
 
 type credWrite struct{ num, email, val string }
@@ -126,8 +131,34 @@ func atoi(s string) int {
 	return n
 }
 
-func (f *fakeAccounts) MigratedSequence() (*SequenceData, error) { return cloneSeq(f.seq), nil }
-func (f *fakeAccounts) Sequence() (*SequenceData, error)         { return cloneSeq(f.seq), nil }
+func (f *fakeAccounts) MigratedSequence() (*SequenceData, error) {
+	f.migratedReads++
+	return cloneSeq(f.seq), nil
+}
+
+func (f *fakeAccounts) Sequence() (*SequenceData, error) {
+	f.plainReads++
+	return cloneSeq(f.seq), nil
+}
+
+// MigratedSequenceForUpdate models store.MigratedSequenceForUpdate's classified
+// contract: a refusal when the roster is there but unreadable (seqUpdateErr), an
+// empty roster when the file is absent, never (nil, nil). seqUpdateNil breaks
+// that contract on purpose, to prove the caller refuses rather than importing
+// into a roster it never saw.
+func (f *fakeAccounts) MigratedSequenceForUpdate() (*SequenceData, error) {
+	f.entryReads++
+	if f.seqUpdateErr != nil {
+		return nil, f.seqUpdateErr
+	}
+	if f.seqUpdateNil {
+		return nil, nil
+	}
+	if f.seq == nil {
+		return &SequenceData{LastUpdated: f.ts, Sequence: []int{}, Accounts: map[string]json.RawMessage{}}, nil
+	}
+	return cloneSeq(f.seq), nil
+}
 
 func (f *fakeAccounts) WriteSequence(data *SequenceData) error {
 	if f.writeSeqErr != nil {

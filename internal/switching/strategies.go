@@ -22,7 +22,9 @@ func selectBestSwitchable(s *store.Store, currentNum string, models []string, us
 		if num == currentNum {
 			continue
 		}
-		if s.AccountIsSwitchable(num) && !disabledFromData(data, num) {
+		// store.RotationEligible owns the rule; the candidate set here is exactly
+		// SwitchableAccountNumbers minus the current slot.
+		if s.RotationEligible(data, num) {
 			others = append(others, num)
 		}
 	}

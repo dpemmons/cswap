@@ -187,6 +187,40 @@ func TestMoveStrictClearFailsClosed(t *testing.T) {
 	}
 }
 
+// TestMoveSwapRefuseCorruptSequence: both entry points read the roster under the
+// lock and refuse an unparseable one. Reporting it as a missing account (what
+// resolution does with an empty roster) would misdirect the user away from a
+// file whose records — and whose backups — are all still there. Every move and
+// swap branch runs behind these two reads, so no branch can proceed on a
+// substituted roster.
+func TestMoveSwapRefuseCorruptSequence(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"zero-byte", ""},
+		{"malformed", "{not json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			seed(t, s, ip(1),
+				switchable("1", "a@example.com"),
+				switchable("2", "b@example.com"),
+			)
+			corruptSequence(t, s, tc.body)
+			before := snapshotStore(t, s)
+
+			_, _, _, err := MoveAccount(s, "1", "2") // occupied target → swap branch
+			assertCorruptRefusal(t, s, err)
+
+			_, _, _, err = MoveAccount(s, "1", "7") // free target → relocate branch
+			assertCorruptRefusal(t, s, err)
+
+			_, _, err = SwapAccounts(s, "1", "2")
+			assertCorruptRefusal(t, s, err)
+
+			assertStoreUnchanged(t, s, before, "a refused move/swap")
+		})
+	}
+}
+
 // TestSwapBasic exchanges two accounts' records and keeps the sequence sorted.
 func TestSwapBasic(t *testing.T) {
 	s := newStore(t)
@@ -358,4 +392,102 @@ func assertNoPrevLeft(t *testing.T, s *store.Store) {
 			t.Errorf(".prev generation left behind: %s", e.Name())
 		}
 	}
+}
+
+// TestMoveSwapBackfillOrgFieldsBeforeReadingTheRosterTheyWrite covers a
+// pre-v0.6.0 roster on both entry points. store.ResolveAccount runs the lazy org
+// backfill inside the locked span and WRITES it, after the read these commands
+// commit; unless the backfill is forced first, that commit reverts it for every
+// slot the command never mentioned.
+func TestMoveSwapBackfillOrgFieldsBeforeReadingTheRosterTheyWrite(t *testing.T) {
+	seedThree := func(t *testing.T) *store.Store {
+		s := newStore(t)
+		seedLegacy(t, s, ip(1),
+			legacyAcct{num: "1", email: "one@example.com", org: "orgA", orgName: "Alpha"},
+			legacyAcct{num: "2", email: "two@example.com", org: "orgB", orgName: "Beta"},
+			legacyAcct{num: "3", email: "three@example.com", org: "orgC", orgName: "Gamma"},
+		)
+		return s
+	}
+
+	t.Run("move", func(t *testing.T) {
+		s := seedThree(t)
+		if _, _, _, err := MoveAccount(s, "1", "4"); err != nil {
+			t.Fatalf("MoveAccount: %v", err)
+		}
+		assertBackfilled(t, s, "4", "orgA", "Alpha") // travelled with the record
+		assertBackfilled(t, s, "2", "orgB", "Beta")
+		assertBackfilled(t, s, "3", "orgC", "Gamma")
+	})
+
+	t.Run("swap", func(t *testing.T) {
+		s := seedThree(t)
+		if _, _, err := SwapAccounts(s, "1", "2"); err != nil {
+			t.Fatalf("SwapAccounts: %v", err)
+		}
+		assertBackfilled(t, s, "1", "orgB", "Beta")
+		assertBackfilled(t, s, "2", "orgA", "Alpha")
+		assertBackfilled(t, s, "3", "orgC", "Gamma")
+	})
+}
+
+// TestLockedBodiesCommitTheRosterTheyWereHanded pins the contract of the two
+// locked bodies: the caller reads the roster once under the lock, validates
+// against it, and hands it down; each body mutates and commits THAT object.
+// The file cannot really change under the lock, so the disagreement is
+// manufactured here — a slot present in the file and absent from the roster in
+// hand. A body that fetched the roster for itself would carry that slot into its
+// commit, which is the same defect as a body validating one roster and writing
+// another.
+func TestLockedBodiesCommitTheRosterTheyWereHanded(t *testing.T) {
+	// handed builds the roster the caller would have read, then leaves the FILE
+	// carrying an extra slot 9 that roster does not know about. Slots 1 and 2 stay
+	// in the file so store.ResolveAccount can still resolve them.
+	handed := func(t *testing.T, s *store.Store) *store.SequenceData {
+		t.Helper()
+		seed(t, s, ip(1), switchable("1", "a@example.com"), switchable("2", "b@example.com"))
+		data := readSeq(t, s)
+		seed(t, s, ip(1),
+			switchable("1", "a@example.com"),
+			switchable("2", "b@example.com"),
+			switchable("9", "rival@example.com"),
+		)
+		return data
+	}
+
+	t.Run("relocate", func(t *testing.T) {
+		s := newStore(t)
+		data := handed(t, s)
+		if err := relocateLocked(s, data, "1", "4"); err != nil {
+			t.Fatalf("relocateLocked: %v", err)
+		}
+		got := readSeq(t, s)
+		if _, ok := got.Accounts["9"]; ok {
+			t.Error("the commit carried a slot that was not in the roster relocate was handed")
+		}
+		if rec(t, got, "4").str("email") != "a@example.com" {
+			t.Errorf("slot 4 = %+v", rec(t, got, "4").vals)
+		}
+		if _, ok := got.Accounts["1"]; ok {
+			t.Error("old slot 1 still present")
+		}
+		if len(got.Sequence) != 2 || got.Sequence[0] != 2 || got.Sequence[1] != 4 {
+			t.Errorf("sequence = %v, want [2 4]", got.Sequence)
+		}
+	})
+
+	t.Run("swap", func(t *testing.T) {
+		s := newStore(t)
+		data := handed(t, s)
+		if _, _, err := swapAccountsLocked(s, data, "1", "2"); err != nil {
+			t.Fatalf("swapAccountsLocked: %v", err)
+		}
+		got := readSeq(t, s)
+		if _, ok := got.Accounts["9"]; ok {
+			t.Error("the commit carried a slot that was not in the roster swap was handed")
+		}
+		if rec(t, got, "1").str("email") != "b@example.com" || rec(t, got, "2").str("email") != "a@example.com" {
+			t.Error("records not swapped in the roster the body was handed")
+		}
+	})
 }

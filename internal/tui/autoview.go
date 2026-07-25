@@ -360,13 +360,12 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	var ranked []candidateRank
 	lines := map[string]richText{}
 	for _, acc := range snap.Accounts {
-		// Skip the active account and non-switchable accounts (no stored
-		// creds/config), and also disabled accounts: the engine's candidate set
-		// excludes them (store SwitchableAccountNumbers = AccountIsSwitchable &&
-		// !disabled), so a disabled account can never be picked — ranking it here
-		// would let the displayed order disagree with every pick (Go-side
-		// deviation, DESIGN A18).
-		if acc.Number == snap.ActiveNumber || !acc.Switchable || acc.Disabled {
+		// Skip the active account and everything the engine's candidate set
+		// excludes — non-switchable (no stored creds/config) and disabled slots,
+		// both carried by the snapshot's single RotationEligible field (store
+		// RotationEligible). A slot the engine can never pick would let the
+		// displayed order disagree with every pick (Go-side deviation, DESIGN A18).
+		if acc.Number == snap.ActiveNumber || !acc.RotationEligible {
 			continue
 		}
 		pct := bindingPct(acc.Usage.LastGood, models)

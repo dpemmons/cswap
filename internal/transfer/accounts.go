@@ -14,11 +14,29 @@ import "git.dpemmons.com/dpemmons/cswap/internal/platform"
 // the core adapter) is given so the frozen shapes stay traceable.
 type Accounts interface {
 	// MigratedSequence returns sequence.json after the org-field backfill has run
-	// (== _get_sequence_data_migrated); nil when absent. → store.SequenceMigrated,
-	// converting *store.SequenceData to *SequenceData.
+	// (== _get_sequence_data_migrated); nil when absent OR unreadable. →
+	// store.SequenceMigrated, converting *store.SequenceData to *SequenceData.
+	// No path that can end in a WriteSequence may start from this read: it
+	// cannot tell a fresh install from a corrupted roster, and the two demand
+	// opposite answers. Use MigratedSequenceForUpdate.
 	MigratedSequence() (*SequenceData, error)
+	// MigratedSequenceForUpdate is the classified entry read every operation
+	// that may WRITE sequence.json begins with, and the only roster it may
+	// thread through its writes. The org-field backfill has run; an ABSENT file
+	// yields an empty (non-nil, non-nil-mapped) roster so the write creates it;
+	// a file that is there but is not a roster — unparseable, JSON null, or
+	// unreadable bytes — is a ConfigError refusal, because substituting an empty
+	// roster would rename a freshly-built file over records whose credential and
+	// config backups are intact but named only there. Never returns (nil, nil).
+	// → store.MigratedSequenceForUpdate (converted).
+	//
+	// Import calls this from inside the write-pass FileLock, so an
+	// implementation MUST NOT acquire that lock itself: it is non-reentrant.
+	MigratedSequenceForUpdate() (*SequenceData, error)
 	// Sequence returns sequence.json WITHOUT triggering the backfill
-	// (== _get_sequence_data); nil when absent. → store.ReadSequence (converted).
+	// (== _get_sequence_data); nil when absent OR unreadable. → store.ReadSequence
+	// (converted). Read-only callers only, for the same reason as
+	// MigratedSequence.
 	Sequence() (*SequenceData, error)
 	// WriteSequence persists sequence.json (== _write_json(sequence_file)). →
 	// store.WriteSequence (converting *SequenceData back). The atomic write +

@@ -3,6 +3,7 @@
 package store
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -172,6 +173,65 @@ func TestApiKeyKindAndDisabled(t *testing.T) {
 	}
 }
 
+// TestRotationEligible pins the one rule every automatic-selection surface asks
+// through (DESIGN A18): switchable AND not disabled. Slot 3 is non-switchable
+// with no backups at all, slot 4 with a credential backup but no config (the
+// half-restored case), so both halves of AccountIsSwitchable are covered.
+func TestRotationEligible(t *testing.T) {
+	s := freshStore(t)
+	writeSequenceRaw(t, s, `{
+  "activeAccountNumber": null,
+  "lastUpdated": "t",
+  "sequence": [1, 2, 3, 4],
+  "accounts": {
+    "1": {"email": "on@x.com", "uuid": "", "organizationUuid": "", "organizationName": "", "added": "t"},
+    "2": {"email": "off@x.com", "uuid": "", "organizationUuid": "", "organizationName": "", "added": "t", "disabled": true},
+    "3": {"email": "bare@x.com", "uuid": "", "organizationUuid": "", "organizationName": "", "added": "t"},
+    "4": {"email": "half@x.com", "uuid": "", "organizationUuid": "", "organizationName": "", "added": "t", "disabled": true}
+  }
+}`)
+	for _, tc := range []struct{ num, email string }{{"1", "on@x.com"}, {"2", "off@x.com"}} {
+		if err := s.Creds.WriteBackup(tc.num, tc.email, "c"); err != nil {
+			t.Fatal(err)
+		}
+		writeBackupConfig(t, s, tc.num, tc.email, `{"oauthAccount":{}}`)
+	}
+	if err := s.Creds.WriteBackup("4", "half@x.com", "c"); err != nil { // creds only
+		t.Fatal(err)
+	}
+
+	data, _ := s.ReadSequence()
+	for _, tc := range []struct {
+		num  string
+		want bool
+		why  string
+	}{
+		{"1", true, "switchable + enabled"},
+		{"2", false, "switchable + disabled"},
+		{"3", false, "non-switchable + enabled"},
+		{"4", false, "non-switchable + disabled"},
+		{"9", false, "unknown slot"},
+	} {
+		if got := s.RotationEligible(data, tc.num); got != tc.want {
+			t.Errorf("RotationEligible(%s) [%s] = %v, want %v", tc.num, tc.why, got, tc.want)
+		}
+	}
+	// The list accessor is the same rule applied over the sequence.
+	if got := s.SwitchableAccountNumbers(); len(got) != 1 || got[0] != "1" {
+		t.Errorf("SwitchableAccountNumbers=%v want [1]", got)
+	}
+
+	// nil data carries no disabled information — not "nothing is disabled". The
+	// switchable half would still answer true off its own read (slot 1 has both
+	// backups), so an unguarded rule would report a slot rotation-eligible on no
+	// evidence, and would report the DISABLED slot 2 eligible too. Fail closed.
+	for _, num := range []string{"1", "2", "3", "9"} {
+		if s.RotationEligible(nil, num) {
+			t.Errorf("RotationEligible(nil, %s) = true, want false (nil data proves nothing)", num)
+		}
+	}
+}
+
 // TestOrgBackfill: a pre-v0.6.0 record missing organizationUuid is backfilled on
 // read via SequenceMigrated — from the backup config for an inactive account,
 // and to "" when no config is present (spec 01§9 / 07§6.1).
@@ -217,6 +277,152 @@ func TestOrgBackfill(t *testing.T) {
 	}
 }
 
+// TestSequenceMigratedClassifiesItsOwnRead: the backfill is a WRITE to
+// sequence.json, so the read that decides whether to run it is classified like
+// any other write-capable entry read (A20 RULE 1). This is the read every
+// lifecycle command performs first — `SequenceMigrated` then `SequenceForUpdate`
+// is written out by hand in add, add-token, alias, disable, move and swap, and
+// wrapped for the rest — so leaving the raw OS error here is what put "read
+// <path>: is a directory" on the user's terminal instead of the refusal that
+// names the path, says the backups are intact, and gives the two ways out.
+func TestSequenceMigratedClassifiesItsOwnRead(t *testing.T) {
+	t.Run("absent stays Python's None", func(t *testing.T) {
+		s := freshStore(t)
+		data, err := s.SequenceMigrated()
+		if data != nil || err != nil {
+			t.Fatalf("SequenceMigrated with no file = %+v, %v; want nil, nil", data, err)
+		}
+	})
+
+	for _, tc := range unreadableRosterCases() {
+		t.Run("unreadable refuses: "+tc.name, func(t *testing.T) {
+			if why := tc.skip(); why != "" {
+				t.Skip(why)
+			}
+			s := freshStore(t)
+			tc.make(t, s)
+
+			data, err := s.SequenceMigrated()
+			if data != nil {
+				t.Errorf("a refusal must hand back no roster, got %+v", data)
+			}
+			if got := cerr.TypeName(err); got != "ConfigError" {
+				t.Fatalf("want the ConfigError refusal, got %q (%v)", got, err)
+			}
+			for _, want := range []string{s.SequenceFile, "unreadable", "intact", "Repair the file"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal message is missing %q: %s", want, err)
+				}
+			}
+
+			// Every identifier-taking command routes through ResolveAccount, which
+			// runs the backfill first; it must refuse the same way rather than
+			// report the roster it could not read as "no such account".
+			if _, _, _, rerr := s.ResolveAccount("1"); cerr.TypeName(rerr) != "ConfigError" {
+				t.Errorf("ResolveAccount on an unreadable roster = %v (%s), want the refusal",
+					rerr, cerr.TypeName(rerr))
+			}
+		})
+	}
+
+	t.Run("unparseable refuses", func(t *testing.T) {
+		s := freshStore(t)
+		writeSequenceRaw(t, s, "{not json")
+		data, err := s.SequenceMigrated()
+		if data != nil || cerr.TypeName(err) != "ConfigError" {
+			t.Fatalf("want a ConfigError refusal, got %+v (%v)", data, err)
+		}
+		raw, _ := os.ReadFile(s.SequenceFile)
+		if string(raw) != "{not json" {
+			t.Errorf("file changed: %q", raw)
+		}
+	})
+}
+
+// TestNullRecordSurvivesEveryRosterRead: a record whose value is the literal
+// null. It reaches the backfill like any record missing organizationUuid, and
+// the backfill ASSIGNS into the decoded record — which is a nil map unless
+// decodeRecord materializes one, so this shape used to abort every command with
+// "panic: assignment to entry in nil map" and a Go stack trace, read-only ones
+// included. Nothing here may panic, and nothing may report a phantom account.
+func TestNullRecordSurvivesEveryRosterRead(t *testing.T) {
+	newStoreWith := func(t *testing.T, rec string) *Store {
+		s := freshStore(t)
+		writeSequenceRaw(t, s, `{
+  "activeAccountNumber": 1,
+  "lastUpdated": "t",
+  "sequence": [1, 2],
+  "accounts": {
+    "1": `+rec+`,
+    "2": {"email": "real@x.com", "uuid": "", "organizationUuid": "", "organizationName": "", "added": "t"}
+  }
+}`)
+		return s
+	}
+
+	// Shapes that keep the DOCUMENT parseable (a truncated record does not: the
+	// whole file is then unparseable, and the classifier tests own that case).
+	for _, shape := range []struct{ name, body string }{
+		{"literal-null", `null`},
+		{"number", `7`},
+		{"string", `"nonsense"`},
+		{"array", `[]`},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			s := newStoreWith(t, shape.body)
+
+			// The backfill runs (slot 1 carries no organizationUuid) and completes.
+			data, err := s.SequenceMigrated()
+			if err != nil {
+				t.Fatalf("SequenceMigrated: %v", err)
+			}
+			if _, ok := data.Accounts["1"]; !ok {
+				t.Error("the malformed slot was dropped from the roster")
+			}
+			if got := strField(decodeRecord(data.Accounts["2"]), "email"); got != "real@x.com" {
+				t.Errorf("the healthy record did not survive: %q", got)
+			}
+
+			// The read-only accessors every command reaches for.
+			if got := s.AccountEmail("1"); got != "" {
+				t.Errorf("AccountEmail(1) = %q, want empty", got)
+			}
+			if got := s.AccountKindFor("1"); got != "oauth" {
+				t.Errorf("AccountKindFor(1) = %q, want oauth", got)
+			}
+			if s.IsAccountDisabled("1") {
+				t.Error("a record with no fields is not disabled")
+			}
+			if id := s.AccountIdentity("1"); id["email"] != "" || id["uuid"] != "" {
+				t.Errorf("AccountIdentity(1) = %v, want blanks", id)
+			}
+			if got := s.FindAccountSlot(data, "", ""); got != "1" {
+				// A fieldless record does match the ("","") identity; what matters is
+				// that the lookup answers rather than panicking.
+				t.Logf("FindAccountSlot(\"\",\"\") = %q", got)
+			}
+			if got := s.FindAccountSlot(data, "real@x.com", ""); got != "2" {
+				t.Errorf("FindAccountSlot for the healthy record = %q, want 2", got)
+			}
+			_ = s.DisabledAccountNumbers()
+			_ = s.SwitchableAccountNumbers()
+			if _, _, _, err := s.ResolveAccount("real@x.com"); err != nil {
+				t.Errorf("ResolveAccount past a malformed record: %v", err)
+			}
+
+			// The uuid backfill assigns into the same decoded record.
+			if err := s.BackfillAccountUUID("1", "uuid-1"); err != nil {
+				t.Errorf("BackfillAccountUUID: %v", err)
+			}
+
+			// And the roster is still a roster afterwards.
+			if _, err := s.SequenceForUpdate(); err != nil {
+				t.Errorf("the roster stopped being readable: %v", err)
+			}
+		})
+	}
+}
+
 // TestOrgBackfill_ActivePrefersLiveConfig: the active account (email matching
 // live ~/.claude.json) is filled from the live config, not the backup.
 func TestOrgBackfill_ActivePrefersLiveConfig(t *testing.T) {
@@ -243,5 +449,68 @@ func TestOrgBackfill_ActivePrefersLiveConfig(t *testing.T) {
 	rec := decodeRecord(data.Accounts["1"])
 	if strField(rec, "organizationUuid") != "live-org" || strField(rec, "organizationName") != "LiveCo" {
 		t.Errorf("active backfill used backup instead of live config: %v", rec)
+	}
+}
+
+// TestMigrateOrgFieldsClassifiesItsOwnRead pins the SECOND classified read.
+// SequenceMigrated classifies once and then hands off to the backfill, which
+// reads sequence.json AGAIN before rewriting it — and between those two reads is
+// a window another process can truncate, replace or unlink the file in. That
+// second read ends in a WriteSequence, which makes it a write-side read like any
+// other (A20 RULE 1) and gives it both obligations at once: a roster it cannot
+// parse must refuse rather than migrate the zero records it managed to read and
+// report success, and a roster whose bytes it cannot obtain at all must refuse
+// with the message that names the file, promises every backup is intact and
+// gives the two ways out — not with the raw OS error of the read, which tells
+// the user only that something is a directory.
+//
+// Neither obligation is visible through SequenceMigrated: its own final read
+// re-classifies, papering over the unparseable case entirely, and the unreadable
+// case needs the file to change between two reads no test can wedge itself
+// between. So the contract is pinned where it lives.
+func TestMigrateOrgFieldsClassifiesItsOwnRead(t *testing.T) {
+	t.Run("absent is nothing to migrate", func(t *testing.T) {
+		s := freshStore(t)
+		if err := s.migrateOrgFields(); err != nil {
+			t.Fatalf("migrateOrgFields with no sequence.json = %v; want nil (Python's None)", err)
+		}
+	})
+
+	t.Run("unparseable refuses", func(t *testing.T) {
+		s := freshStore(t)
+		writeSequenceRaw(t, s, "{not json")
+
+		err := s.migrateOrgFields()
+		if got := cerr.TypeName(err); got != "ConfigError" {
+			t.Fatalf("migrateOrgFields on an unparseable roster = %v (%q), want the ConfigError refusal", err, got)
+		}
+		for _, want := range []string{s.SequenceFile, "not valid JSON", "intact", "Repair the file"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal message is missing %q: %s", want, err)
+			}
+		}
+		if raw, _ := os.ReadFile(s.SequenceFile); string(raw) != "{not json" {
+			t.Errorf("the refusal rewrote the file: %q", raw)
+		}
+	})
+
+	for _, tc := range unreadableRosterCases() {
+		t.Run("unreadable refuses: "+tc.name, func(t *testing.T) {
+			if why := tc.skip(); why != "" {
+				t.Skip(why)
+			}
+			s := freshStore(t)
+			tc.make(t, s)
+
+			err := s.migrateOrgFields()
+			if got := cerr.TypeName(err); got != "ConfigError" {
+				t.Fatalf("migrateOrgFields on an unreadable roster = %v (%q), want the ConfigError refusal", err, got)
+			}
+			for _, want := range []string{s.SequenceFile, "unreadable", "intact", "Repair the file"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal message is missing %q: %s", want, err)
+				}
+			}
+		})
 	}
 }

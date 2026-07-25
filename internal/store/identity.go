@@ -23,31 +23,45 @@ import (
 // SequenceMigrated returns sequence.json after ensuring the org-field backfill
 // has run: if any record lacks the organizationUuid key it fires
 // migrateOrgFields once and re-reads (spec 07§6.1 _get_sequence_data_migrated).
+//
+// Its read is CLASSIFIED (A20 RULE 1) rather than ReadSequence's collapsing one,
+// because the backfill is a write to sequence.json: a file that is present but
+// is no roster — bytes that do not parse, or bytes that cannot be read at all —
+// is corruption, and every operation that begins by running the backfill must
+// refuse with the actionable ConfigError rather than surface the raw OS error of
+// this read or migrate what it could not read. Absence keeps Python's
+// None — no file, nothing to migrate — so the display-only callers that read a
+// nil roster as "no accounts yet" are unaffected, as are the callers that
+// discard the error entirely.
 func (s *Store) SequenceMigrated() (*SequenceData, error) {
-	data, err := s.ReadSequence()
-	if err != nil {
+	data, err := s.classifiedRoster()
+	if err != nil || data == nil {
 		return nil, err
 	}
-	if data == nil {
+	if !needsOrgBackfill(data) {
 		return data, nil
 	}
-	needs := false
+	if err := s.migrateOrgFields(); err != nil {
+		return nil, err
+	}
+	return s.classifiedRoster()
+}
+
+// needsOrgBackfill reports whether any record is missing the organizationUuid
+// KEY — presence, not value, so a record already carrying "" is migrated (spec
+// 07§6.1). Bytes that do not decode into an object probe at all are no evidence
+// either way and do not fire the backfill by themselves; the literal null does
+// decode (to nothing), so it counts as missing the key.
+func needsOrgBackfill(data *SequenceData) bool {
 	for _, raw := range data.Accounts {
 		var probe map[string]json.RawMessage
 		if json.Unmarshal(raw, &probe) == nil {
 			if _, ok := probe["organizationUuid"]; !ok {
-				needs = true
-				break
+				return true
 			}
 		}
 	}
-	if needs {
-		if err := s.migrateOrgFields(); err != nil {
-			return nil, err
-		}
-		return s.ReadSequence()
-	}
-	return data, nil
+	return false
 }
 
 // migrateOrgFields backfills organizationUuid/organizationName on every record
@@ -57,8 +71,13 @@ func (s *Store) SequenceMigrated() (*SequenceData, error) {
 // both fields defaulting to "" on any absence or parse failure. The migration
 // is per-field-presence: a record already carrying organizationUuid (even "")
 // is skipped. Writes back only if something changed.
+//
+// It ends in a WriteSequence, so its own read is classified (A20 RULE 1) even
+// though SequenceMigrated has already classified once: a roster that goes
+// unreadable between the two reads must refuse, not migrate what it could not
+// read and not hand back a raw OS error.
 func (s *Store) migrateOrgFields() error {
-	data, err := s.ReadSequence()
+	data, err := s.classifiedRoster()
 	if err != nil {
 		return err
 	}
@@ -368,8 +387,30 @@ func (s *Store) AccountIsSwitchable(num string) bool {
 	return true
 }
 
-// SwitchableAccountNumbers returns the rotation-eligible slots: switchable and
-// not disabled, in sequence order (spec 01§8.4 switchable_account_numbers).
+// RotationEligible is the sole owner of the automatic-rotation eligibility rule
+// (spec 01§8.4 switchable_account_numbers): switchable and not disabled. Every
+// surface that asks "may automatic selection pick this slot" must ask through
+// here, so the rule can never drift between them (DESIGN A18). It does not know
+// about the auto-switch engine's transient quarantine (autoswitch_state.json),
+// so it is necessary but not sufficient for "the engine could pick this slot
+// now".
+//
+// data must be the caller's already-loaded sequence data and is the ONLY source
+// for the disabled half, while the switchable half re-reads the backups itself.
+// nil data therefore carries no disabled information at all — it is not "nothing
+// is disabled" — so it returns false. Fail-closed is the only safe direction
+// here: the false negative merely omits a slot from automatic selection, whereas
+// a false positive would let automatic selection pick a slot the user
+// deliberately held out of rotation.
+func (s *Store) RotationEligible(data *SequenceData, num string) bool {
+	if data == nil {
+		return false
+	}
+	return s.AccountIsSwitchable(num) && !disabledFromData(data, num)
+}
+
+// SwitchableAccountNumbers returns the rotation-eligible slots in sequence order
+// (spec 01§8.4 switchable_account_numbers).
 func (s *Store) SwitchableAccountNumbers() []string {
 	data, _ := s.ReadSequence()
 	if data == nil {
@@ -378,7 +419,7 @@ func (s *Store) SwitchableAccountNumbers() []string {
 	var out []string
 	for _, n := range data.Sequence {
 		num := strconv.Itoa(n)
-		if s.AccountIsSwitchable(num) && !disabledFromData(data, num) {
+		if s.RotationEligible(data, num) {
 			out = append(out, num)
 		}
 	}

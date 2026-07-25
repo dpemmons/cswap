@@ -59,6 +59,27 @@ func TestDisableUnknown(t *testing.T) {
 	}
 }
 
+// TestDisableRefusesCorruptSequence: sequence.json exists but does not parse, so
+// this is corruption rather than "Account-1 does not exist" — the slot's record
+// is still in the file and repairable.
+func TestDisableRefusesCorruptSequence(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"zero-byte", ""},
+		{"malformed", "{not json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			seed(t, s, ip(1), switchable("1", "a@example.com"), switchable("2", "b@example.com"))
+			corruptSequence(t, s, tc.body)
+			before := snapshotStore(t, s)
+
+			assertCorruptRefusal(t, s, SetAccountDisabled(s, "1", true))
+			assertCorruptRefusal(t, s, SetAccountDisabled(s, "1", false))
+			assertStoreUnchanged(t, s, before, "a refused disable/enable")
+		})
+	}
+}
+
 // TestDisableEmptyRotationWarns: disabling the last switchable slot warns that
 // rotation is empty (spec 01§8.4).
 func TestDisableEmptyRotationWarns(t *testing.T) {
@@ -83,5 +104,27 @@ func TestDisableActiveHint(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "It is the active account") {
 		t.Errorf("missing active-account note: %q", out.String())
+	}
+}
+
+// TestDisableBackfillsOrgFieldsBeforeReadingTheRosterItWrites covers a
+// pre-v0.6.0 roster: store.ResolveAccount runs the lazy org backfill and WRITES
+// it, after the read this command commits. Without forcing the backfill first,
+// that commit reverts it for every slot the command never mentioned.
+func TestDisableBackfillsOrgFieldsBeforeReadingTheRosterItWrites(t *testing.T) {
+	s := newStore(t)
+	seedLegacy(t, s, ip(1),
+		legacyAcct{num: "1", email: "one@example.com", org: "orgA", orgName: "Alpha"},
+		legacyAcct{num: "2", email: "two@example.com", org: "orgB", orgName: "Beta"},
+		legacyAcct{num: "3", email: "three@example.com", org: "orgC", orgName: "Gamma"},
+	)
+	if err := SetAccountDisabled(s, "1", true); err != nil {
+		t.Fatalf("SetAccountDisabled: %v", err)
+	}
+	assertBackfilled(t, s, "1", "orgA", "Alpha")
+	assertBackfilled(t, s, "2", "orgB", "Beta")
+	assertBackfilled(t, s, "3", "orgC", "Gamma")
+	if !rec(t, readSeq(t, s), "1").boolVal("disabled") {
+		t.Error("slot 1 not disabled")
 	}
 }

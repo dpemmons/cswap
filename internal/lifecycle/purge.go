@@ -81,6 +81,12 @@ func Purge(s *store.Store) error {
 
 	var removed []string
 
+	// Purge's only roster read, and the one operation that reads it through
+	// ReadSequence by design: it never writes sequence.json — it deletes the
+	// directory containing it — so it needs no classification and must not refuse
+	// an unparseable file. The roster is used solely to enumerate per-account
+	// credential keys; a nil one just means that enumeration contributes nothing,
+	// and the directory removal below still takes everything with it.
 	data, _ := s.ReadSequence()
 	if data != nil {
 		for _, num := range sortedSlots(data) {

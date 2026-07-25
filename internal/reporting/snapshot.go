@@ -21,16 +21,30 @@ import (
 // reads Usage.LastGood/AgeS directly (may show old data, age-annotated), while
 // Usage.Sentinel carries derived states that replace the bars entirely.
 type AccountSnapshot struct {
-	Number     string
-	Email      string
-	OrgName    string
-	OrgUUID    string
-	IsActive   bool
-	Kind       string // "oauth" | "api_key"
+	Number   string
+	Email    string
+	OrgName  string
+	OrgUUID  string
+	IsActive bool
+	Kind     string // "oauth" | "api_key"
+	// Switchable reports that the slot has both a stored credential and a stored
+	// config backup, independent of the disabled flag (store.AccountIsSwitchable).
 	Switchable bool
 	Usage      usage.UsageEntry
 	Alias      string
 	Disabled   bool // held out of auto-rotation (still a valid explicit target)
+	// RotationEligible is store.RotationEligible's rule — Switchable && !Disabled,
+	// and false outright when the roster could not be read (see rotationEligible).
+	// The snapshot carries all three so no consumer has to re-derive or re-AND
+	// them (DESIGN A18); the two inputs are not otherwise recoverable from the
+	// conjunction. It is eligibility for AUTOMATIC selection only, and it does NOT
+	// account for the auto-switch engine's transient quarantine (that lives in
+	// autoswitch_state.json): it is necessary but not sufficient for "the engine
+	// could pick this slot now". The per-reason skip warnings that distinguish
+	// "(disabled)" from "no stored credentials/config" are produced in
+	// switching/switch.go, which reads the store directly rather than this
+	// snapshot.
+	RotationEligible bool
 	// AtLimit is set when the account's decision-grade usage sits at/over a rate
 	// limit, folding in the per-model weekly windows configured via
 	// autoswitch.model; LimitingWindows names the limiting windows in
@@ -71,19 +85,22 @@ func Snapshot(s *store.Store, fetch map[string]bool) *AccountsSnapshot {
 			activeNumber = num
 		}
 		atLimit, limiting := atLimitFor(entries[num].DecisionValue(), models)
+		switchable := s.AccountIsSwitchable(num)
+		disabled := recordDisabled(data, num)
 		accounts = append(accounts, AccountSnapshot{
-			Number:          num,
-			Email:           info.Email,
-			OrgName:         info.OrgName,
-			OrgUUID:         info.OrgUUID,
-			IsActive:        info.IsActive,
-			Kind:            s.AccountKindFor(num),
-			Switchable:      s.AccountIsSwitchable(num),
-			Usage:           entries[num],
-			Alias:           info.Alias,
-			Disabled:        recordDisabled(data, num),
-			AtLimit:         atLimit,
-			LimitingWindows: limiting,
+			Number:           num,
+			Email:            info.Email,
+			OrgName:          info.OrgName,
+			OrgUUID:          info.OrgUUID,
+			IsActive:         info.IsActive,
+			Kind:             s.AccountKindFor(num),
+			Switchable:       switchable,
+			Usage:            entries[num],
+			Alias:            info.Alias,
+			Disabled:         disabled,
+			RotationEligible: rotationEligible(data, switchable, disabled),
+			AtLimit:          atLimit,
+			LimitingWindows:  limiting,
 		})
 	}
 	return &AccountsSnapshot{
@@ -91,6 +108,22 @@ func Snapshot(s *store.Store, fetch map[string]bool) *AccountsSnapshot {
 		Accounts:     accounts,
 		TakenAt:      clock.Seconds(s.Clk),
 	}
+}
+
+// rotationEligible is store.RotationEligible's rule spelled out over values the
+// one-pass snapshot already holds, so the field costs no second credential and
+// config read per account (DESIGN A19 names this the one inlined derivation).
+// Being a copy, it fails closed on the same input the owner does: data is the
+// ONLY source for the disabled half, so a nil roster carries no disabled
+// information at all — it is not "nothing is disabled" — and no slot is
+// eligible. The two halves do not come from one read (switchable is answered by
+// a per-account re-read inside store.AccountIsSwitchable, disabled from the one
+// roster in hand), and rows are already in hand from BuildAccountsInfo's earlier
+// read, so a nil roster here is reachable while the other half still answers
+// yes. ANDing a fresh answer with a blind one would rank a slot the user
+// deliberately held out of rotation.
+func rotationEligible(data *store.SequenceData, switchable, disabled bool) bool {
+	return data != nil && switchable && !disabled
 }
 
 // UsageFetchStamps returns each managed slot's fetchedAt from the usage store — a

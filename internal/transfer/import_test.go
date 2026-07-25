@@ -621,6 +621,97 @@ func TestImportNonStringFieldRejected(t *testing.T) {
 	}
 }
 
+// TestImportRefusesWhenTheLocalRosterIsUnreadable is the destructive case the
+// classified entry read exists for: sequence.json is THERE with three accounts
+// but cannot be read as a roster, and a one-account export arrives. Substituting
+// an empty roster would rename a one-account file over the other three records,
+// orphaning credential and config backups that nothing else names. The import
+// must refuse before its first write, leaving every record and both backup
+// stores exactly as they were.
+func TestImportRefusesWhenTheLocalRosterIsUnreadable(t *testing.T) {
+	f := newFakeAccounts(t)
+	for _, num := range []string{"1", "2", "3"} {
+		f.seedAccount(num, "local"+num+"@example.com", "", recordOpts{
+			creds: "creds-" + num, config: `{"oauthAccount":{}}`,
+		})
+	}
+	before := cloneSeq(f.seq)
+	f.seqUpdateErr = cerr.Config("%s is not valid JSON, so the accounts it lists cannot be read — "+
+		"refusing to overwrite it.", "/x/sequence.json")
+
+	text := envelopeJSON(1, oauthAccount(9, "imported@example.com", ""))
+	stderr, err := importText(t, f, text, false)
+
+	if cerr.TypeName(err) != "ConfigError" {
+		t.Fatalf("want the roster refusal, got %v (%s)", err, cerr.TypeName(err))
+	}
+	if f.writeSeqCount != 0 {
+		t.Errorf("the roster was written %d time(s) over an unreadable file", f.writeSeqCount)
+	}
+	if len(f.writtenCreds) != 0 || len(f.writtenConfig) != 0 {
+		t.Errorf("backups written before the refusal: creds=%v config=%v", f.writtenCreds, f.writtenConfig)
+	}
+	if len(f.seq.Accounts) != len(before.Accounts) {
+		t.Errorf("local roster changed: %d accounts, want %d", len(f.seq.Accounts), len(before.Accounts))
+	}
+	for _, line := range []string{"Imported", "Done:"} {
+		if strings.Contains(stderr, line) {
+			t.Errorf("a refused import reported success (%q): %s", line, stderr)
+		}
+	}
+}
+
+// TestImportRefusesWhenTheEntryReadBreaksItsContract: the classified read
+// promises a roster or a refusal, never (nil, nil). If that ever regresses,
+// import must still refuse rather than build a fresh roster over records it
+// never saw — the same destruction by a different route.
+func TestImportRefusesWhenTheEntryReadBreaksItsContract(t *testing.T) {
+	f := newFakeAccounts(t)
+	f.seedAccount("1", "local@example.com", "", recordOpts{creds: "c", config: "{}"})
+	f.seqUpdateNil = true
+
+	_, err := importText(t, f, envelopeJSON(nil, oauthAccount(1, "a@example.com", "")), false)
+	if cerr.TypeName(err) != "ConfigError" {
+		t.Fatalf("want a ConfigError refusal, got %v (%s)", err, cerr.TypeName(err))
+	}
+	if f.writeSeqCount != 0 || len(f.writtenCreds) != 0 {
+		t.Errorf("wrote despite having no roster: seq=%d creds=%v", f.writeSeqCount, f.writtenCreds)
+	}
+}
+
+// TestImportReadsTheRosterOnce pins the threading: one classified read at entry
+// answers the alias check, every slot decision, and the activeAccountNumber
+// seeding. A re-fetch mid-flight can only disagree with the roster the slots
+// were chosen against — it can never add information, since nothing but this
+// import writes sequence.json between them.
+func TestImportReadsTheRosterOnce(t *testing.T) {
+	f := newFakeAccounts(t)
+	f.seedAccount("1", "local@example.com", "", recordOpts{creds: "c", config: "{}"})
+	text := envelopeJSON(2,
+		oauthAccount(2, "a@example.com", "one"),
+		oauthAccount(3, "b@example.com", "two"))
+
+	if _, err := importText(t, f, text, false); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if f.entryReads != 1 {
+		t.Errorf("classified entry reads = %d, want exactly 1", f.entryReads)
+	}
+	if f.migratedReads != 0 || f.plainReads != 0 {
+		t.Errorf("roster re-fetched mid-flight: migrated=%d plain=%d", f.migratedReads, f.plainReads)
+	}
+	// And the threaded roster carried every decision: both new slots, the
+	// pre-existing one, and the seeded active slot.
+	for _, num := range []string{"1", "2", "3"} {
+		if _, ok := f.seq.Accounts[num]; !ok {
+			t.Errorf("slot %s missing from the written roster: %v", num, f.seq.Accounts)
+		}
+	}
+	if f.seq.ActiveAccountNumber == nil || *f.seq.ActiveAccountNumber != 2 {
+		t.Errorf("activeAccountNumber = %v, want 2", f.seq.ActiveAccountNumber)
+	}
+}
+
 // mustClearErr ensures a ClearDeadToken failure aborts the import (uncaught in
 // Python).
 func TestImportClearDeadTokenErrorAborts(t *testing.T) {

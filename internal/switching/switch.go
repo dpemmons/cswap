@@ -301,8 +301,13 @@ func switchFreshMachine(s *store.Store, strategyLabel string, jsonOut bool, warn
 	}
 
 	target := itoa(prefInt)
+	// Whether the preferred target is skipped is store.RotationEligible's call —
+	// the one owner of the rule (DESIGN A18/A19) — while the two halves are still
+	// read apart here only to WORD the notice, which says "(disabled)" or names
+	// the re-add command. A19's exception is for the rotation loop in Switch,
+	// which decides on its own inline tests; nothing on this path decides on one.
 	targetDisabled := disabledFromData(data, target)
-	if targetDisabled || !s.AccountIsSwitchable(target) {
+	if !s.RotationEligible(data, target) {
 		var reason, consoleReason string
 		if targetDisabled {
 			reason, consoleReason = "(disabled)", "(disabled)"
@@ -315,10 +320,12 @@ func switchFreshMachine(s *store.Store, strategyLabel string, jsonOut bool, warn
 		} else {
 			printOut(printer.Accent("Skipping") + " Account-" + target + " " + consoleReason)
 		}
+		// The fallback is chosen automatically and announced by nothing, so it asks
+		// the same owner with no reason to unpack at all.
 		fallback := ""
 		for _, num := range sequence {
 			cand := itoa(num)
-			if cand != target && !disabledFromData(data, cand) && s.AccountIsSwitchable(cand) {
+			if cand != target && s.RotationEligible(data, cand) {
 				fallback = cand
 				break
 			}

@@ -208,6 +208,128 @@ func TestSwitchNoopReasons(t *testing.T) {
 	})
 }
 
+// TestSwitchFreshMachineFallbackIsRotationEligible covers the fresh-machine path
+// (no live login), where BOTH decisions — is the preferred slot usable, and which
+// slot replaces it — are store.RotationEligible's, the sole owner of "may
+// automatic selection pick this slot" (DESIGN A18). DESIGN A19's inline exception
+// belongs to the rotation loop in Switch alone, which decides on its own tests;
+// this path only WORDS its notice from the two halves, and the fallback scan does
+// not even do that. What is pinned here is the observable behaviour that must not
+// shift: which slot is chosen, and that the one warning names the skipped
+// preferred slot with the reason it was skipped for.
+func TestSwitchFreshMachineFallbackIsRotationEligible(t *testing.T) {
+	// setup seeds a no-live-login store whose preferred slot 1 is disabled, plus
+	// slots 2..4 configured per the case. Every seeded slot gets backups unless
+	// noBackup says otherwise, so "not eligible" comes only from the flag under test.
+	setup := func(t *testing.T, disabled map[string]bool, noBackup map[string]bool) *store.Store {
+		s := newTestStore(t, nil)
+		recs := map[string]json.RawMessage{}
+		for _, num := range []string{"1", "2", "3", "4"} {
+			email := "acc" + num + "@x.com"
+			fields := map[string]any{"email": email, "organizationUuid": ""}
+			if disabled[num] {
+				fields["disabled"] = true
+			}
+			recs[num] = record(fields)
+			if !noBackup[num] {
+				seedBackup(t, s, num, email, oauthCreds("acc-"+num, "ref-"+num), "")
+			}
+		}
+		writeSeq(t, s, seqData(ptrInt(1), []int{1, 2, 3, 4}, recs))
+		return s // no ~/.claude.json ⇒ fresh machine
+	}
+
+	warningsOf := func(t *testing.T, m map[string]any) []string {
+		t.Helper()
+		w, _ := m["warnings"].([]string)
+		return w
+	}
+
+	t.Run("skips a disabled candidate silently and lands on the first eligible slot", func(t *testing.T) {
+		s := setup(t, map[string]bool{"1": true, "2": true}, nil)
+		out, err := Switch(s, nil, true, nil, nil)
+		if err != nil {
+			t.Fatalf("Switch: %v", err)
+		}
+		m := asMap(t, out)
+		if refField(t, m, "to") != 3 {
+			t.Fatalf("landed on %d, want 3 (2 is disabled)", refField(t, m, "to"))
+		}
+		w := warningsOf(t, m)
+		if len(w) != 1 || w[0] != "Skipped Account-1 (disabled)" {
+			t.Fatalf("warnings = %v, want exactly the skipped-preferred-slot line", w)
+		}
+	})
+
+	// The preferred slot is skipped by one rule and reported by two: the decision
+	// is the owner's, the wording still separates "you disabled this" from "this
+	// slot has no backups", which are different things for the user to do next.
+	t.Run("the preferred slot's skip reason survives the shared rule", func(t *testing.T) {
+		for _, tc := range []struct {
+			name        string
+			disabled    map[string]bool
+			noBackup    map[string]bool
+			wantWarning string
+		}{
+			{
+				name:        "disabled",
+				disabled:    map[string]bool{"1": true},
+				wantWarning: "Skipped Account-1 (disabled)",
+			},
+			{
+				name:        "no backups",
+				noBackup:    map[string]bool{"1": true},
+				wantWarning: "Skipped Account-1 (no stored credentials/config)",
+			},
+			{
+				name:        "disabled wins when both are true",
+				disabled:    map[string]bool{"1": true},
+				noBackup:    map[string]bool{"1": true},
+				wantWarning: "Skipped Account-1 (disabled)",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := setup(t, tc.disabled, tc.noBackup)
+				out, err := Switch(s, nil, true, nil, nil)
+				if err != nil {
+					t.Fatalf("Switch: %v", err)
+				}
+				m := asMap(t, out)
+				if refField(t, m, "to") != 2 {
+					t.Fatalf("landed on %d, want 2", refField(t, m, "to"))
+				}
+				w := warningsOf(t, m)
+				if len(w) != 1 || w[0] != tc.wantWarning {
+					t.Fatalf("warnings = %v, want exactly [%q]", w, tc.wantWarning)
+				}
+			})
+		}
+	})
+
+	t.Run("skips an unswitchable candidate silently", func(t *testing.T) {
+		s := setup(t, map[string]bool{"1": true}, map[string]bool{"2": true})
+		out, err := Switch(s, nil, true, nil, nil)
+		if err != nil {
+			t.Fatalf("Switch: %v", err)
+		}
+		m := asMap(t, out)
+		if refField(t, m, "to") != 3 {
+			t.Fatalf("landed on %d, want 3 (2 has no backups)", refField(t, m, "to"))
+		}
+		if w := warningsOf(t, m); len(w) != 1 {
+			t.Fatalf("warnings = %v, want only the skipped-preferred-slot line", w)
+		}
+	})
+
+	t.Run("every other slot disabled leaves no rotation target", func(t *testing.T) {
+		s := setup(t, map[string]bool{"1": true, "2": true, "3": true, "4": true}, nil)
+		_, err := Switch(s, nil, true, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "No accounts remain in rotation") {
+			t.Fatalf("err = %v, want the re-enable guidance", err)
+		}
+	})
+}
+
 // TestSwitchNoAccounts: no sequence.json ⇒ ConfigError.
 func TestSwitchNoAccounts(t *testing.T) {
 	s := newTestStore(t, nil)
