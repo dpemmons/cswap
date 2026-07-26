@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/autoswitch"
 	"git.dpemmons.com/dpemmons/cswap/internal/reporting"
@@ -65,6 +66,7 @@ type autoScreen struct {
 	dryRun              bool
 	log                 []logLine
 	candidates          richText
+	candidatesWidth     int // column budget a.candidates was laid out at
 	quarantined         map[string]string
 	loaded              bool
 }
@@ -114,10 +116,29 @@ func (a *autoScreen) onExit(m *Model) tea.Cmd {
 // slot the engine quarantines mid-session is labeled on the next poll.
 func (a *autoScreen) onSnapshot(m *Model) tea.Cmd {
 	a.refreshQuarantine(m)
-	if m.snapshot != nil {
-		a.candidates = a.candidatesText(m.snapshot)
-	}
+	a.rebuildCandidates(m, panelWidth(m))
 	return nil
+}
+
+// rebuildCandidates re-lays the ranked panel out at a column budget, recording
+// the width it was laid out at: a candidate row's cells and email are fitted to
+// that width, so view() re-lays the panel after a resize instead of letting a row
+// wrap (DESIGN A18).
+func (a *autoScreen) rebuildCandidates(m *Model, width int) {
+	if m.snapshot == nil {
+		return
+	}
+	a.candidates = a.candidatesText(m.snapshot, width)
+	a.candidatesWidth = width
+}
+
+// panelWidth is the column budget the auto screen lays its chrome out at: the
+// terminal width, or the 80-column fallback while the size is still unknown.
+func panelWidth(m *Model) int {
+	if m.width <= 0 {
+		return 80
+	}
+	return m.width
 }
 
 func (a *autoScreen) update(m *Model, msg tea.Msg) tea.Cmd {
@@ -305,9 +326,7 @@ func (a *autoScreen) setThreshold(m *Model, value float64) {
 	}
 	v := value
 	m.thresholdPct = &v
-	if m.snapshot != nil {
-		a.candidates = a.candidatesText(m.snapshot)
-	}
+	a.rebuildCandidates(m, panelWidth(m))
 }
 
 // endAdjust leaves adjust mode; a net change wakes the engine and logs a
@@ -354,7 +373,17 @@ type candidateRank struct {
 // panel but labeled and ranked into the non-viable tail (above sentinel and
 // usage-unknown rows), so a row shown as a viable target is always one the engine
 // could pick this tick apart from freshness (panel contract, DESIGN A18).
-func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
+//
+// A readable row shows every window the account reports rather than one bare
+// number, so the reason a candidate ranks where it does is on the row (DESIGN
+// A18): the binding window is emphasized, the other counted windows stay
+// readable, and scoped windows autoswitch.model does not match are muted
+// information — see candidateRow. width is the column budget a row must fit in
+// (a row never wraps); width <= 0 falls back to 80 columns, as footerText does.
+func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int) richText {
+	if width <= 0 {
+		width = 80
+	}
 	models := settings.ParseModelNames(a.settings.Model)
 	threshold := a.settings.Threshold // session-adjusted; same value the engine gets
 	var ranked []candidateRank
@@ -370,8 +399,6 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 		}
 		pct := bindingPct(acc.Usage.LastGood, models)
 		var entry richText
-		entry.addFg(fmt.Sprintf("\n  %2s  ", acc.Number), colForeground)
-		entry.addFg(acc.Email, colForeground)
 		switch {
 		case a.isQuarantined(acc.Number):
 			// The engine quarantined this slot (invalid_grant / identity conflict)
@@ -379,16 +406,19 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 			// its cached usage may look healthy. Keep the row but label it and rank
 			// it into the non-viable tail (DESIGN A18). Quarantine takes precedence
 			// over the sentinel and usage cells below.
-			entry.addFg("  "+quarantineLabel(a.quarantined[acc.Number]), colSevWarn)
+			entry = candidateLabelRow(acc.Number, acc.Email,
+				quarantineLabel(a.quarantined[acc.Number]), colSevWarn, width)
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 997.0, tier: 4})
 		case acc.Usage.Sentinel != "":
-			entry.addFg("  "+sentinelLabel(acc.Usage.Sentinel), colMuted)
+			entry = candidateLabelRow(acc.Number, acc.Email,
+				sentinelLabel(acc.Usage.Sentinel), colMuted, width)
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 998.0, tier: 5})
 		case pct == nil:
-			entry.addFg("  usage unknown", colMuted)
+			entry = candidateLabelRow(acc.Number, acc.Email, "usage unknown", colMuted, width)
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 6})
 		default:
-			entry.add(fmt.Sprintf("  %3.0f%% used", *pct), segStyle{Fg: severityColorF(*pct)})
+			entry = candidateRow(acc.Number, acc.Email,
+				candidateWindows(acc.Usage.LastGood, models), width)
 			r := candidateRank{number: acc.Number, bestKey: *pct, pct: *pct,
 				renewal: renewalTS(acc.Usage.LastGood, models)}
 			switch {
@@ -406,10 +436,14 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 		lines[acc.Number] = entry
 	}
 
-	var out richText
-	out.addFg("Next best", colMuted)
+	var head richText
+	head.addFg("Next best", colMuted)
+	head.addFg(" · "+countingNote(models), colMuted)
+	out := truncRich(head, width)
 	if len(ranked) == 0 {
-		out.addFg("\n  no other switchable accounts", colMuted)
+		var empty richText
+		empty.addFg("  no other switchable accounts", colMuted)
+		out.addText(candidateRowText(empty, width))
 		return out
 	}
 	less := candidateLessBest
@@ -420,6 +454,248 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot) richText {
 	for _, r := range ranked {
 		out.addText(lines[r.number])
 	}
+	return out
+}
+
+// countingNote names the decision axis the panel ranks on, once, in the header,
+// so the muted cells on a row read as deliberate rather than mysterious: the
+// counted windows are always 5h and 7d, plus each scoped per-model weekly window
+// autoswitch.model names (the "all" sentinel counts every one of them, and
+// subsumes any name listed with it). Model names appear exactly as
+// settings.ParseModelNames yields them (Go-side extension, DESIGN A18).
+func countingNote(models []string) string {
+	parts := []string{"5h", "7d"}
+	for _, name := range models {
+		if strings.EqualFold(name, allModelsSentinel) {
+			parts = append(parts[:2], "all models")
+			break
+		}
+		parts = append(parts, name)
+	}
+	return "counting " + strings.Join(parts, ", ")
+}
+
+// Candidate-row layout (09§4.7). The cell separator borrows the mini account
+// row's grammar (09§5.5: "5h 12% · 7d 88%") so one usage vocabulary runs through
+// the whole TUI.
+const (
+	candidateGap = "  "  // email → first window cell, or → the label
+	candidateSep = " · " // between window cells
+)
+
+// candidateNumber is a row's visible left margin + slot number cell. Fixed
+// width and free of the row break, so the row's width math can measure it.
+func candidateNumber(number string) string { return fmt.Sprintf("  %2s  ", number) }
+
+// candidateRowText begins a panel row: the row break as its own UNSTYLED
+// segment, then the body fitted to width.
+//
+// No STYLED segment may ever carry a newline. richText.render styles each
+// segment on its own, and lipgloss returns a style-less segment verbatim but
+// left-aligns a styled one by padding every line out to the widest — so a styled
+// segment holding "\n" + a cell renders its blank first line as that many spaces
+// appended to the END of the previous row, pushing it past the width and
+// wrapping it. Every row shape starts here, so the break stays outside every
+// styled cell (DESIGN A18).
+func candidateRowText(body richText, width int) richText {
+	var t richText
+	t.addPlain("\n")
+	return *t.addText(truncRich(body, width))
+}
+
+// candidateLabelRow renders a candidate the panel cannot rank by usage — a
+// quarantined, sentinel or usage-unknown slot: slot number, email, then the
+// label saying why the engine will not pick it.
+//
+// The row NEVER wraps, on the same precedence candidateRow uses: the slot number
+// always survives, the email clips first (down to the bare ellipsis), and the
+// label — the reason the row is on the panel at all — truncates with an ellipsis
+// only as the last resort. The label text itself is never reworded to fit.
+func candidateLabelRow(number, email, label, color string, width int) richText {
+	head := candidateNumber(number)
+	fixed := lipgloss.Width(head) + lipgloss.Width(candidateGap)
+	shownEmail, shownLabel := email, label
+	if over := fixed + lipgloss.Width(email) + lipgloss.Width(label) - width; over > 0 {
+		budget := lipgloss.Width(email) - over
+		if budget < 1 {
+			budget = 1 // clip to the ellipsis; the label outranks the email
+		}
+		shownEmail = clipText(email, budget)
+	}
+	if over := fixed + lipgloss.Width(shownEmail) + lipgloss.Width(label) - width; over > 0 {
+		shownLabel = clipText(label, lipgloss.Width(label)-over)
+	}
+	var body richText
+	body.addFg(head, colForeground)
+	body.addFg(shownEmail, colForeground)
+	body.addPlain(candidateGap)
+	body.addFg(shownLabel, color)
+	return candidateRowText(body, width)
+}
+
+// candidateRow renders a readable candidate's row: slot number, email, then one
+// cell per window the account reports, in oauth.RelevantWindows order (5h, 7d,
+// then the account's scoped windows). The three emphasis levels carry the panel's
+// contract (Go-side extension, DESIGN A18):
+//
+//   - BINDING — the counted window with the highest pct: the number the row is
+//     ranked by and the one the engine decides on. Severity-colored and bold.
+//   - COUNTED but not binding — relevant on the configured autoswitch.model axis,
+//     so it could bind once it climbs. Readable, in the plain label/foreground
+//     palette.
+//   - UNCOUNTED — a scoped window autoswitch.model does not match. It affects
+//     neither the ranking nor the engine's pick, so it is muted and dim: visible
+//     (the user must be able to watch a per-model window fill before configuring
+//     it) but plainly informational.
+//
+// The row NEVER wraps. While it overflows width it drops the rightmost uncounted
+// cell, then the rightmost non-binding counted cell, then clips the email. The
+// binding cell is the ranking key and is never dropped; a width too small even
+// for that clips the whole line rather than letting it fold.
+func candidateRow(number, email string, cells []candidateWindow, width int) richText {
+	head := candidateNumber(number)
+	keep := make([]bool, len(cells))
+	for i := range keep {
+		keep[i] = true
+	}
+	rowWidth := func(email string) int {
+		w := lipgloss.Width(head) + lipgloss.Width(email)
+		shown := 0
+		for i, cell := range cells {
+			if !keep[i] {
+				continue
+			}
+			lead := candidateSep
+			if shown == 0 {
+				lead = candidateGap // the first cell follows the email gap
+			}
+			w += lipgloss.Width(lead) + lipgloss.Width(candidateCellText(cell))
+			shown++
+		}
+		return w
+	}
+	for rowWidth(email) > width && dropCandidateCell(cells, keep) {
+		// Shed cells until the row fits or only the binding one is left.
+	}
+	shown := email
+	if over := rowWidth(shown) - width; over > 0 {
+		budget := lipgloss.Width(email) - over
+		if budget < 1 {
+			budget = 1 // clip to the ellipsis; the binding cell outranks the email
+		}
+		shown = clipText(email, budget)
+	}
+
+	var body richText
+	body.addFg(head, colForeground)
+	body.addFg(shown, colForeground)
+	first := true
+	for i, cell := range cells {
+		if !keep[i] {
+			continue
+		}
+		if first {
+			body.addPlain(candidateGap)
+			first = false
+		} else {
+			body.addFg(candidateSep, colTrack)
+		}
+		addCandidateCell(&body, cell)
+	}
+	return candidateRowText(body, width)
+}
+
+// candidateCellText is one window cell's text: "7d 88%" (09§5.5's grammar).
+func candidateCellText(cell candidateWindow) string {
+	return fmt.Sprintf("%s %.0f%%", cell.Label, cell.Pct)
+}
+
+// addCandidateCell appends one window cell at its emphasis level (see
+// candidateRow): binding → severity-colored + bold, counted → the plain
+// label/foreground palette, uncounted → muted and dim.
+func addCandidateCell(t *richText, cell candidateWindow) {
+	switch {
+	case cell.Binding:
+		t.add(candidateCellText(cell), segStyle{Fg: severityColorF(cell.Pct), Bold: true})
+	case cell.Counted:
+		t.addFg(cell.Label+" ", colMuted)
+		t.addFg(fmt.Sprintf("%.0f%%", cell.Pct), colForeground)
+	default:
+		t.add(candidateCellText(cell), segStyle{Fg: colMuted, Dim: true})
+	}
+}
+
+// dropCandidateCell drops the least informative still-shown cell — the rightmost
+// uncounted one, else the rightmost non-binding counted one — and reports whether
+// it dropped anything. The binding cell is never a candidate for dropping.
+func dropCandidateCell(cells []candidateWindow, keep []bool) bool {
+	for _, counted := range []bool{false, true} {
+		for i := len(cells) - 1; i >= 0; i-- {
+			if keep[i] && !cells[i].Binding && cells[i].Counted == counted {
+				keep[i] = false
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// clipText cuts s to at most width display columns, ending in an ellipsis when it
+// had to cut (footer.go's marker, one cell wide).
+func clipText(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	limit := width - lipgloss.Width(footerEllipse)
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if used+rw > limit {
+			break
+		}
+		b.WriteRune(r)
+		used += rw
+	}
+	return b.String() + footerEllipse
+}
+
+// truncRich cuts a single-line richText to at most width display columns,
+// preserving each surviving segment's styling and marking the cut with a muted
+// ellipsis. Fits the panel header, and is the last-resort guard against a row
+// wide enough to wrap.
+func truncRich(t richText, width int) richText {
+	if width <= 0 {
+		return richText{}
+	}
+	if lipgloss.Width(t.plain()) <= width {
+		return t
+	}
+	limit := width - lipgloss.Width(footerEllipse)
+	var out richText
+	used := 0
+	for _, s := range t.segs {
+		if w := lipgloss.Width(s.Text); used+w <= limit {
+			out.add(s.Text, s.Style)
+			used += w
+			continue
+		}
+		var b strings.Builder
+		for _, r := range s.Text {
+			rw := lipgloss.Width(string(r))
+			if used+rw > limit {
+				break
+			}
+			b.WriteRune(r)
+			used += rw
+		}
+		out.add(b.String(), s.Style)
+		break
+	}
+	out.addFg(footerEllipse, colMuted)
 	return out
 }
 
@@ -510,9 +786,12 @@ func (a *autoScreen) footerBindings(m *Model) []footerBinding {
 // -- rendering ---------------------------------------------------------------
 
 func (a *autoScreen) view(m *Model) string {
-	inner := m.width
-	if inner == 0 {
-		inner = 80
+	inner := panelWidth(m)
+	// A resize changes what fits on a candidate row (which window cells survive,
+	// whether the email clips), and the panel is otherwise only rebuilt on the poll
+	// cadence — re-lay it out here the moment the width moves (DESIGN A18).
+	if inner != a.candidatesWidth {
+		a.rebuildCandidates(m, inner)
 	}
 	// Pinned chrome: the active account card, the mode badge + summary line, and
 	// the ranked candidates. Only the event log below flexes (09§4: the RichLog

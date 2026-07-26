@@ -40,7 +40,7 @@ func TestAutoViewTailFollowsAndPinsStatus(t *testing.T) {
 		acct("2", "other@x.com", false, nil))
 	a := newAutoScreen()
 	a.dryRun = true
-	a.candidates = a.candidatesText(m.snapshot)
+	a.candidates = a.candidatesText(m.snapshot, 0)
 	for i := 0; i < 40; i++ {
 		a.appendSystem(fmt.Sprintf("evt%02d", i))
 	}

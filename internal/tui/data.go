@@ -30,6 +30,12 @@ const serveTTLS = usage.ServeTTLS
 // staleOKS is the bar-dimming staleness floor (09§5.4, usage_store.STALE_OK_S).
 const staleOKS = usage.StaleOKS
 
+// allModelsSentinel is the autoswitch.model value that matches every scoped
+// per-model weekly window (04§1.19; spelled as a literal in each package that
+// matches it). Used here to enumerate an account's scoped windows through
+// oauth.RelevantWindows itself instead of re-implementing its matcher.
+const allModelsSentinel = "all"
+
 // sentinelNotes maps a sentinel state to the exact wording cswap list prints
 // (09§12 SENTINEL_NOTES). The fallback is the raw sentinel string. Byte-
 // identical to reporting's own map so both surfaces describe a state the same.
@@ -89,6 +95,58 @@ func bindingPct(lastGood map[string]any, models []string) *float64 {
 	}
 	pct := 100.0 - *h
 	return &pct
+}
+
+// candidateWindow is one window cell of a candidates-panel row: the label and
+// utilization the account reports for that window, plus whether the window is
+// COUNTED (relevant on the configured autoswitch.model axis, so it can gate the
+// engine's pick) and whether it is the BINDING one (the counted window the row's
+// bindingPct — and the engine's decision — comes from). Go-side extension
+// (DESIGN A18).
+type candidateWindow struct {
+	Label   string
+	Pct     float64
+	Counted bool
+	Binding bool
+}
+
+// candidateWindows enumerates every window an account reports, in
+// oauth.RelevantWindows order (5h, then 7d, then the account's scoped per-model
+// weekly windows in their own order), marking which ones count and which one
+// binds.
+//
+// Both lists come from oauth.RelevantWindows itself — the full list through the
+// "all" sentinel, the counted list through the configured models — so the panel
+// can never disagree with the engine about what is relevant, and the counted
+// list is by construction a subsequence of the full one (walked here with a
+// single cursor). Scoped windows autoswitch.model does not match are listed but
+// left uncounted: they are informational, and never affect the ranking.
+//
+// The binding window is the counted window with the highest pct, the FIRST one
+// winning a tie — exactly the maximum oauth.AccountHeadroom projects, so the
+// marked cell always carries the number bindingPct ranks the row by. Spend stays
+// out of both lists (a separate axis, 04§1.19). nil/empty usage → no windows.
+func candidateWindows(lastGood map[string]any, models []string) []candidateWindow {
+	u := oauth.NewUsage(lastGood)
+	all := oauth.RelevantWindows(u, []string{allModelsSentinel})
+	counted := oauth.RelevantWindows(u, models)
+	out := make([]candidateWindow, 0, len(all))
+	cursor, binding := 0, -1
+	for _, w := range all {
+		cell := candidateWindow{Label: w.Label, Pct: w.Pct}
+		if cursor < len(counted) && counted[cursor] == w {
+			cell.Counted = true
+			cursor++
+			if binding < 0 || cell.Pct > out[binding].Pct {
+				binding = len(out)
+			}
+		}
+		out = append(out, cell)
+	}
+	if binding >= 0 {
+		out[binding].Binding = true
+	}
+	return out
 }
 
 // renewalTS returns the account's weekly-scope renewal epoch (the latest

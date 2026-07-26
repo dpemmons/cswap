@@ -1191,6 +1191,103 @@ untouched — `cswap list`'s `(disabled)` marker
 (`internal/reporting/list.go`, via `printer.Muted`) stays exactly as it is,
 preserving byte-fidelity with the Python original for CLI surfaces.
 
+**Per-window display and emphasis (Go-side additive extension).**
+Python's `_candidates_text` (spec 09§4.7) renders a row's usage cell as the
+single blended figure `f"  {pct:3.0f}% used"`. `candidatesText`'s usage cell
+for a row with readable usage instead lists every window `oauth.NewUsage`
+projects for the account — `Usage.FiveHour`, `Usage.SevenDay`, then each
+`Usage.Scoped` entry in the account's own order — as `{label} {pct:.0f}%`
+segments joined by ` · `, with no filtering by `autoswitch.model`: an
+unmatched scoped window still renders, because a user configuring
+`autoswitch.model` needs to see a window filling up before naming it. This
+is a deliberate Go-side extension with no Python counterpart, exactly as
+A17's `soonest-reset`; Python's `_candidates_text` has no per-window
+breakdown to port.
+
+Which windows *count* is unchanged from what `bindingPct` and
+`oauth.AccountHeadroom` already compute: a window counts iff it is a member
+of `oauth.RelevantWindows(u, models)` — `5h` and `7d` always, plus a scoped
+window `autoswitch.model` names. The counted window with the highest `Pct`
+is the row's binding window: the same figure `bindingPct` returns, and the
+only one `candidateLessBest`/`candidateLessSoonest` compare against — this
+amendment touches display, not ranking, so both comparators and the tier
+assignment they read (A17) are untouched. Ties on the maximum resolve to
+the first window in `RelevantWindows` order (`5h` before `7d` before a
+scoped window), matching `oauth.AccountHeadroom`'s own `max` scan, which
+only replaces `max` on a strict `>` and so keeps the first window on a tie.
+
+Emphasis has three levels, applied per window segment (`addCandidateCell`):
+
+- The binding window renders in `severityColorF` of its own `Pct`, bold.
+- A counted, non-binding window renders label in `colMuted`, `Pct` in
+  `colForeground`, no bold: readable, but plain rather than
+  severity-colored. `miniAccountText`'s window cells, by contrast, do
+  severity-color every counted `Pct` (`severityColorF`); a candidate row
+  withholds that color from the non-binding cells on purpose, so a
+  non-binding figure never competes with the binding one for the eye on
+  severity — exactly one cell per row reads as urgent.
+- An uncounted (unmatched scoped) window renders muted (`colMuted`)
+  throughout, label and percentage alike, so it reads as informational
+  rather than as a figure that could be mistaken for a ranked one.
+
+The panel header states the counted axis once so the muting is explained
+rather than mysterious: `candidatesText` appends a muted suffix to `"Next
+best"` naming the counted labels in `RelevantWindows` order — `5h, 7d` with
+`autoswitch.model` unset; `5h, 7d, Fable` with it set to `Fable`
+(`settings.ParseModelNames`'s output, not the raw stored string); `5h, 7d,
+all models` for the `all` sentinel, since naming every matched scoped
+window individually would defeat the point of the sentinel.
+
+**Width and the never-wrap contract.** Every line the panel emits — the
+`"Next best · counting ..."` header, a readable usage row (`candidateRow`),
+a quarantined/sentinel/usage-unknown row (`candidateLabelRow`, one function
+for all three), and the `"no other switchable accounts"` empty-state line —
+must never wrap regardless of terminal width. `candidatesText` takes the
+same inner width `accountsPanelText` already receives from `view` (`m.width`,
+defaulted the same way, `width <= 0` falling back to 80), and each row shape
+fits its own body to that width before render. The header runs straight
+through `truncRich`; every row below it — a readable usage row, a label row,
+and the empty-state line — runs its fitted body through `truncRich` via the
+shared `candidateRowText`, described below.
+
+The ellipsis falls in a different place for each row shape:
+
+- A readable usage row degrades in the order stated above: drop the
+  rightmost uncounted window, then the rightmost non-binding counted
+  window, then clip the email down to a bare ellipsis. The binding cell —
+  the row's ranking key, the figure the engine's own pick agrees with — is
+  dropped last, never before every other option is exhausted.
+- A quarantined, sentinel, or usage-unknown row carries no window cells to
+  shed, so `candidateLabelRow` narrows it in a different order: the slot
+  number always survives; the email clips first, down to a bare ellipsis;
+  only once the email is fully clipped and the row still does not fit does
+  the label itself lose its tail to an ellipsis. The label's own wording is
+  truncated, never reworded — the reason a row sits on the panel at all is
+  the last thing given up.
+- The header and the empty-state line carry no cells or label to shed —
+  each is one run of muted text — and clip as a whole line with a trailing
+  ellipsis when the terminal is narrower than the text itself.
+
+A row that still overflows after its own shape-specific narrowing truncates
+as a whole line via the shared `truncRich` guard rather than wrap,
+consistent with `view`'s pinned-chrome layout, where no panel line is
+allowed to push the scrollable event log around.
+
+**Why every row below the header routes through `candidateRowText`.** Each
+of those rows' fitted body picks up its leading row break there, and the
+break is appended as its OWN unstyled segment ahead of the styled body
+rather than folded into the body's first colored segment (the header needs
+no such break — it opens the panel). `richText.render` styles each segment
+independently, and lipgloss's left-align padding stretches every rendered
+line out to the widest line in the block; a styled segment whose text
+starts with a newline would have that blank leading line padded out to the
+panel's full width, and the padding lands at the END of the PRECEDING row,
+not the row the segment belongs to — so a row that individually fits its
+own width could still push the row ABOVE it past the terminal width and
+wrap. Routing every such row through one function that keeps the break
+unstyled is what makes the never-wrap contract hold across the whole
+rendered panel at once, not merely line-by-line in isolation.
+
 ## A19. `store.RotationEligible` — one owner for rotation eligibility; two audited limitations
 
 **One predicate, four call sites across three files, one inlined

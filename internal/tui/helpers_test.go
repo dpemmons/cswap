@@ -5,10 +5,13 @@
 package tui
 
 import (
+	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"git.dpemmons.com/dpemmons/cswap/internal/autoswitch"
 	"git.dpemmons.com/dpemmons/cswap/internal/reporting"
@@ -185,6 +188,29 @@ func runCmd(cmd tea.Cmd) tea.Msg {
 		return nil
 	}
 	return cmd()
+}
+
+// -- rendered-output helpers ---------------------------------------------------
+
+// renderedLines returns the ANSI-free lines of a RENDERED richText — what the
+// terminal actually receives. Width contracts must be measured here and never on
+// plain(): render styles each segment on its own, and lipgloss left-aligns a
+// multi-line segment by padding every line out to the widest, so a segment
+// carrying a newline grows the neighboring line by padding plain() cannot see.
+func renderedLines(rt richText) []string {
+	return strings.Split(stripANSI(rt.render()), "\n")
+}
+
+// assertNoWrap fails unless every rendered line of rt fits in width columns.
+func assertNoWrap(t *testing.T, rt richText, width int) {
+	t.Helper()
+	lines := renderedLines(rt)
+	for i, line := range lines {
+		if w := lipgloss.Width(line); w > width {
+			t.Fatalf("rendered line %d is %d columns, want <= %d (a row must never wrap): %q\nrendered panel:\n%s",
+				i, w, width, line, strings.Join(lines, "\n"))
+		}
+	}
 }
 
 // execAll recursively executes a cmd and every tea.Batch child, so a batched
