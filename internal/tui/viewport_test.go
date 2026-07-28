@@ -40,7 +40,8 @@ func TestAutoViewTailFollowsAndPinsStatus(t *testing.T) {
 		acct("2", "other@x.com", false, nil))
 	a := newAutoScreen()
 	a.dryRun = true
-	a.candidates = a.candidatesText(m.snapshot, 0)
+	// The candidates panel needs no priming: view() builds it from m.snapshot on
+	// every render (so its live reset countdowns are never stale).
 	for i := 0; i < 40; i++ {
 		a.appendSystem(fmt.Sprintf("evt%02d", i))
 	}

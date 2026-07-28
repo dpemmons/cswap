@@ -98,16 +98,23 @@ func bindingPct(lastGood map[string]any, models []string) *float64 {
 }
 
 // candidateWindow is one window cell of a candidates-panel row: the label and
-// utilization the account reports for that window, plus whether the window is
-// COUNTED (relevant on the configured autoswitch.model axis, so it can gate the
-// engine's pick) and whether it is the BINDING one (the counted window the row's
+// utilization the account reports for that window, the raw resets_at the panel
+// derives that window's live countdown from, plus whether the window is COUNTED
+// (relevant on the configured autoswitch.model axis, so it can gate the engine's
+// pick) and whether it is the BINDING one (the counted window the row's
 // bindingPct — and the engine's decision — comes from). Go-side extension
 // (DESIGN A18).
+//
+// ResetsAt is carried RAW (never a pre-rendered countdown): reset math is
+// recomputed live at render time from resets_at, because a stored string drifts
+// as the measurement ages (09§12). "" or unparseable means the window's reset is
+// unknown, and the cell shows no countdown at all.
 type candidateWindow struct {
-	Label   string
-	Pct     float64
-	Counted bool
-	Binding bool
+	Label    string
+	Pct      float64
+	ResetsAt string
+	Counted  bool
+	Binding  bool
 }
 
 // candidateWindows enumerates every window an account reports, in
@@ -133,7 +140,7 @@ func candidateWindows(lastGood map[string]any, models []string) []candidateWindo
 	out := make([]candidateWindow, 0, len(all))
 	cursor, binding := 0, -1
 	for _, w := range all {
-		cell := candidateWindow{Label: w.Label, Pct: w.Pct}
+		cell := candidateWindow{Label: w.Label, Pct: w.Pct, ResetsAt: w.ResetsAt}
 		if cursor < len(counted) && counted[cursor] == w {
 			cell.Counted = true
 			cursor++
@@ -174,6 +181,20 @@ func resetText(window map[string]any, now float64) string {
 		return "resets now"
 	}
 	return "resets " + formatDuration(remaining)
+}
+
+// candidateCountdown renders the live countdown a candidates-panel window cell
+// shows beside its utilization: "resets 2h 13m", "resets now" once the reset has
+// elapsed, or "" when the window carries no parseable resets_at (the cell then
+// shows no countdown at all). now is fractional Unix seconds.
+//
+// Delegates to resetText so the panel can never grow a second reset vocabulary
+// or a second duration grammar: one wording ("resets …"/"resets now", formatted
+// by formatDuration) runs through the account card's bar suffixes, the mini
+// account row and this cell alike (09§6.3, DESIGN A18). Takes the raw resets_at
+// string because a candidateWindow carries the timestamp, not the window map.
+func candidateCountdown(resetsAt string, now float64) string {
+	return resetText(map[string]any{"resets_at": resetsAt}, now)
 }
 
 // resetClock returns the absolute local reset time ("20:39" / "Jul 14 09:00"),

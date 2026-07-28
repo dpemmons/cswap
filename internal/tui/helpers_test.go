@@ -180,6 +180,35 @@ func timeAheadISO(now, secs float64) string {
 	return unixToTime(now + secs).Format(time.RFC3339)
 }
 
+// testNow is the frozen render clock the candidates-panel tests inject
+// (2026-07-17T00:00:00Z in fractional Unix seconds). Every window reset a panel
+// fixture carries is expressed relative to it via timeAheadISO, so the live
+// countdowns those rows render are deterministic — the renderer never reads the
+// wall clock itself.
+const testNow = 1_784_246_400.0
+
+// withReset attaches a resets_at to ONE window of a last_good map and returns the
+// map, so a fixture can mix known, elapsed, unparseable and absent resets. key is
+// "five_hour"/"seven_day" or a scoped window's display name; the value is stored
+// raw, exactly as a fetched usage map carries it.
+func withReset(t *testing.T, lastGood map[string]any, key, resetsAt string) map[string]any {
+	t.Helper()
+	if w, ok := lastGood[key].(map[string]any); ok {
+		w["resets_at"] = resetsAt
+		return lastGood
+	}
+	scoped, _ := lastGood["scoped"].([]any)
+	for _, item := range scoped {
+		w, ok := item.(map[string]any)
+		if ok && w["name"] == key {
+			w["resets_at"] = resetsAt
+			return lastGood
+		}
+	}
+	t.Fatalf("no window %q in fixture %v", key, lastGood)
+	return nil
+}
+
 // runCmd executes a tea.Cmd and returns its message (nil for a nil cmd or a nil
 // message). tea.Batch is flattened one level; the first non-nil msg wins for
 // tests that expect a single message.

@@ -1230,6 +1230,26 @@ Emphasis has three levels, applied per window segment (`addCandidateCell`):
   throughout, label and percentage alike, so it reads as informational
   rather than as a figure that could be mistaken for a ranked one.
 
+**Reset countdowns.** A window cell carries the time until that window
+resets — `7d 88% (resets 2d 4h)` — so a row answers both how used an
+account is and when it frees up. `candidateWindow` carries the raw
+`ResetsAt` projected by `oauth.RelevantWindows`; `candidateCountdown`
+derives the displayed text through `resetText`, so the panel shares one
+duration grammar and one elapsed wording (`resets now`) with the account
+card and the mini rows rather than growing a second vocabulary. The
+derivation is live, against the `now` `view` passes: a window's stored
+countdown string is correct only at fetch time and drifts as the
+measurement ages (09§12), so it is never displayed. A window whose
+`ResetsAt` is absent or unparseable renders no parenthetical, leaving the
+cell exactly as it would be without this projection.
+
+A countdown takes its cell's emphasis level but is never bold, the binding
+cell included: the percentage is the ranking figure and holds the emphasis
+alone. `candidatesText` is called per render rather than cached, so a
+displayed countdown is at most one repaint old — the TUI's own poll timer
+re-arms every `pollIntervalS`, bounding that regardless of the engine's
+poll interval or user activity.
+
 The panel header states the counted axis once so the muting is explained
 rather than mysterious: `candidatesText` appends a muted suffix to `"Next
 best"` naming the counted labels in `RelevantWindows` order — `5h, 7d` with
@@ -1252,11 +1272,16 @@ shared `candidateRowText`, described below.
 
 The ellipsis falls in a different place for each row shape:
 
-- A readable usage row degrades in the order stated above: drop the
-  rightmost uncounted window, then the rightmost non-binding counted
-  window, then clip the email down to a bare ellipsis. The binding cell —
-  the row's ranking key, the figure the engine's own pick agrees with — is
-  dropped last, never before every other option is exhausted.
+- A readable usage row sheds one reduction per re-measure, down the rungs
+  of `candidateShedSteps`: the countdowns of its uncounted windows, those
+  windows, the countdowns of its counted non-binding windows, those
+  windows, and the binding window's own countdown — rightmost first within
+  each rung — after which the email clips down to a bare ellipsis. A
+  countdown is supporting detail, so it always precedes the cell carrying
+  it, and a whole class precedes the next more informative one. The binding
+  window's label and percentage are on no rung at all: they are the row's
+  ranking key and the figure the engine's own pick agrees with, and they
+  survive every reduction.
 - A quarantined, sentinel, or usage-unknown row carries no window cells to
   shed, so `candidateLabelRow` narrows it in a different order: the slot
   number always survives; the email clips first, down to a bare ellipsis;

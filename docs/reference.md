@@ -1586,18 +1586,26 @@ logging in with the account and running `cswap add`.
 A candidate row with a readable usage figure lists every rate-limit window
 the account reports, not only the one it is ranked by: `5h`, `7d`, and one
 entry per per-model weekly window the account carries, each rendered as
-`<label> <pct>%` and joined on the one line, in that fixed order (`5h`,
-then `7d`, then the account's own per-model windows). Which windows count
+`<label> <pct>% (resets <duration>)` and joined on the one line, in that
+fixed order (`5h`, then `7d`, then the account's own per-model windows).
+The countdown is recomputed from the window's reset timestamp at render
+time, never served from the countdown string the measurement was fetched
+with: a stored string is correct only at fetch time and drifts as the
+measurement ages. A window whose reset has already elapsed reads `(resets
+now)`; a window whose reset timestamp is absent or unparseable carries no
+parenthetical at all. Which windows count
 toward the row's rank — and toward the auto engine's own pick — is a
 narrower set: `5h` and `7d` always, plus a per-model window named by
 `autoswitch.model` (see SETTINGS below). Every other per-model window still
 renders — so a window can be watched before it is configured to matter —
 but never moves the row's rank. The highest percentage among the counted
 windows is the row's binding window: the same figure the row is ranked by
-and the one the engine acts on. It renders bold, in its usual severity
-color; the row's other counted windows render in the ordinary readable
-style; its uncounted windows render muted, so the three kinds read apart at
-a glance. The panel header states the counted axis once — `Next best ·
+and the one the engine acts on. Its label and percentage render bold, in
+the usual severity color; the row's other counted windows render in the
+ordinary readable style; its uncounted windows render muted, so the three
+kinds read apart at a glance. A countdown takes its cell's kind but is
+never bold, including inside the binding cell: the percentage is the
+figure the row is ranked by, and the countdown supports it. The panel header states the counted axis once — `Next best ·
 counting 5h, 7d`, or, with `autoswitch.model` set, `Next best · counting
 5h, 7d, Fable` (`Next best · counting 5h, 7d, all models` for the `all`
 sentinel) — so an uncounted window's muting reads as a stated rule rather
@@ -1606,10 +1614,15 @@ than an unexplained dimming.
 No line in the panel ever wraps, regardless of terminal width — the header,
 a readable usage row, a quarantined/sentinel/usage-unknown row, and the
 empty-state "no other switchable accounts" line alike. A readable usage row
-that does not fit narrows in order: uncounted windows drop first, then
-counted windows other than the binding one, then the email truncates with
-an ellipsis; the binding window's cell — the row's ranking key — is never
-dropped. A quarantined, sentinel, or usage-unknown row carries no window
+that does not fit narrows one reduction at a time, in this order: the
+countdowns of its uncounted windows, then those windows entirely, then the
+countdowns of its counted windows other than the binding one, then those
+windows entirely, then the binding window's own countdown, and last the
+email, which truncates with an ellipsis. A countdown always goes before the
+window carrying it, and a whole class goes before the next more informative
+one; within a class the rightmost cell gives ground first. The binding
+window's label and percentage — the row's ranking key — are on no rung and
+survive every reduction. A quarantined, sentinel, or usage-unknown row carries no window
 cells to drop, so it narrows differently: the email truncates first, down
 to a bare ellipsis, and only once the email is gone does the label itself
 lose its tail to an ellipsis; the slot number always survives, and the

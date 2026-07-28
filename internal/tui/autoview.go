@@ -65,8 +65,6 @@ type autoScreen struct {
 	events              chan tea.Msg
 	dryRun              bool
 	log                 []logLine
-	candidates          richText
-	candidatesWidth     int // column budget a.candidates was laid out at
 	quarantined         map[string]string
 	loaded              bool
 }
@@ -111,25 +109,15 @@ func (a *autoScreen) onExit(m *Model) tea.Cmd {
 	return m.setStoreOnly(false)
 }
 
-// onSnapshot re-reads the quarantine set and recomputes the candidates panel
-// (09§4.7). The quarantine refresh rides the same cadence as the snapshot so a
-// slot the engine quarantines mid-session is labeled on the next poll.
+// onSnapshot re-reads the quarantine set (09§4.7). The quarantine refresh rides
+// the same cadence as the snapshot so a slot the engine quarantines mid-session
+// is labeled on the next poll. The ranked panel itself is not cached — view()
+// builds it from the current snapshot and the current clock on every render, so
+// its live reset countdowns are never staler than the frame they appear in
+// (DESIGN A18).
 func (a *autoScreen) onSnapshot(m *Model) tea.Cmd {
 	a.refreshQuarantine(m)
-	a.rebuildCandidates(m, panelWidth(m))
 	return nil
-}
-
-// rebuildCandidates re-lays the ranked panel out at a column budget, recording
-// the width it was laid out at: a candidate row's cells and email are fitted to
-// that width, so view() re-lays the panel after a resize instead of letting a row
-// wrap (DESIGN A18).
-func (a *autoScreen) rebuildCandidates(m *Model, width int) {
-	if m.snapshot == nil {
-		return
-	}
-	a.candidates = a.candidatesText(m.snapshot, width)
-	a.candidatesWidth = width
 }
 
 // panelWidth is the column budget the auto screen lays its chrome out at: the
@@ -326,7 +314,7 @@ func (a *autoScreen) setThreshold(m *Model, value float64) {
 	}
 	v := value
 	m.thresholdPct = &v
-	a.rebuildCandidates(m, panelWidth(m))
+	// The panel's tiering reads this threshold; the next render rebuilds it.
 }
 
 // endAdjust leaves adjust mode; a net change wakes the engine and logs a
@@ -380,7 +368,14 @@ type candidateRank struct {
 // readable, and scoped windows autoswitch.model does not match are muted
 // information — see candidateRow. width is the column budget a row must fit in
 // (a row never wraps); width <= 0 falls back to 80 columns, as footerText does.
-func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int) richText {
+// now is the render clock in fractional Unix seconds, from which each window
+// cell's reset countdown is derived live (never a stored countdown string, 09§12).
+// A nil snapshot (nothing polled yet) renders nothing — the accounts panel above
+// already says "loading…".
+func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int, now float64) richText {
+	if snap == nil {
+		return richText{}
+	}
 	if width <= 0 {
 		width = 80
 	}
@@ -418,7 +413,7 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int)
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 6})
 		default:
 			entry = candidateRow(acc.Number, acc.Email,
-				candidateWindows(acc.Usage.LastGood, models), width)
+				candidateWindows(acc.Usage.LastGood, models), width, now)
 			r := candidateRank{number: acc.Number, bestKey: *pct, pct: *pct,
 				renewal: renewalTS(acc.Usage.LastGood, models)}
 			switch {
@@ -535,8 +530,12 @@ func candidateLabelRow(number, email, label, color string, width int) richText {
 
 // candidateRow renders a readable candidate's row: slot number, email, then one
 // cell per window the account reports, in oauth.RelevantWindows order (5h, 7d,
-// then the account's scoped windows). The three emphasis levels carry the panel's
-// contract (Go-side extension, DESIGN A18):
+// then the account's scoped windows). Each cell answers both questions a switch
+// target raises — "how used is it" and "when does it free up" — as
+// "{label} {pct}% ({countdown})", the countdown derived live from that window's
+// resets_at against now (DESIGN A18; a window with no parseable resets_at simply
+// shows no parenthetical). The three emphasis levels carry the panel's contract
+// (Go-side extension, DESIGN A18):
 //
 //   - BINDING — the counted window with the highest pct: the number the row is
 //     ranked by and the one the engine decides on. Severity-colored and bold.
@@ -548,34 +547,35 @@ func candidateLabelRow(number, email, label, color string, width int) richText {
 //     (the user must be able to watch a per-model window fill before configuring
 //     it) but plainly informational.
 //
-// The row NEVER wraps. While it overflows width it drops the rightmost uncounted
-// cell, then the rightmost non-binding counted cell, then clips the email. The
-// binding cell is the ranking key and is never dropped; a width too small even
-// for that clips the whole line rather than letting it fold.
-func candidateRow(number, email string, cells []candidateWindow, width int) richText {
+// A cell's countdown inherits its cell's level, except that it is never bold: in
+// a binding cell the pct is the emphasized figure and the countdown is muted
+// supporting detail, exactly as the mini account row renders its own "(resets …)"
+// suffix (09§5.5).
+//
+// The row NEVER wraps; see shedCandidateCell for the order it sheds in. Once
+// nothing is left to shed the email clips, and a width too small even for the
+// binding cell clips the whole line rather than letting it fold.
+func candidateRow(number, email string, windows []candidateWindow, width int, now float64) richText {
 	head := candidateNumber(number)
-	keep := make([]bool, len(cells))
-	for i := range keep {
-		keep[i] = true
-	}
+	cells := candidateCells(windows, now)
 	rowWidth := func(email string) int {
 		w := lipgloss.Width(head) + lipgloss.Width(email)
 		shown := 0
-		for i, cell := range cells {
-			if !keep[i] {
+		for _, cell := range cells {
+			if !cell.shown {
 				continue
 			}
 			lead := candidateSep
 			if shown == 0 {
 				lead = candidateGap // the first cell follows the email gap
 			}
-			w += lipgloss.Width(lead) + lipgloss.Width(candidateCellText(cell))
+			w += lipgloss.Width(lead) + lipgloss.Width(cell.text())
 			shown++
 		}
 		return w
 	}
-	for rowWidth(email) > width && dropCandidateCell(cells, keep) {
-		// Shed cells until the row fits or only the binding one is left.
+	for rowWidth(email) > width && shedCandidateCell(cells) {
+		// Shed detail until the row fits or only the binding pct is left.
 	}
 	shown := email
 	if over := rowWidth(shown) - width; over > 0 {
@@ -590,8 +590,8 @@ func candidateRow(number, email string, cells []candidateWindow, width int) rich
 	body.addFg(head, colForeground)
 	body.addFg(shown, colForeground)
 	first := true
-	for i, cell := range cells {
-		if !keep[i] {
+	for _, cell := range cells {
+		if !cell.shown {
 			continue
 		}
 		if first {
@@ -605,34 +605,114 @@ func candidateRow(number, email string, cells []candidateWindow, width int) rich
 	return candidateRowText(body, width)
 }
 
-// candidateCellText is one window cell's text: "7d 88%" (09§5.5's grammar).
-func candidateCellText(cell candidateWindow) string {
-	return fmt.Sprintf("%s %.0f%%", cell.Label, cell.Pct)
+// candidateCell is one window cell as a row lays it out: the window itself, the
+// live countdown resolved once for this render, and the two width-ladder flags
+// (whether the cell shows at all, and whether it still shows its countdown).
+type candidateCell struct {
+	win       candidateWindow
+	countdown string // "" when the window carries no parseable resets_at
+	shown     bool
+	showReset bool
 }
+
+// candidateCells resolves each window's live countdown once per row (the reset
+// math is recomputed from resets_at at render time, 09§12) and starts every cell
+// fully shown — the width ladder takes detail away from there.
+func candidateCells(windows []candidateWindow, now float64) []candidateCell {
+	cells := make([]candidateCell, 0, len(windows))
+	for _, w := range windows {
+		cd := candidateCountdown(w.ResetsAt, now)
+		cells = append(cells, candidateCell{win: w, countdown: cd, shown: true, showReset: cd != ""})
+	}
+	return cells
+}
+
+// head is the cell's utilization figure: "7d 88%" (09§5.5's grammar).
+func (c candidateCell) head() string {
+	return fmt.Sprintf("%s %.0f%%", c.win.Label, c.win.Pct)
+}
+
+// resetSuffix is the cell's countdown parenthetical (" (resets 2h 13m)"), or ""
+// when the window has no known reset or the width ladder has dropped it.
+func (c candidateCell) resetSuffix() string {
+	if !c.showReset {
+		return ""
+	}
+	return " (" + c.countdown + ")"
+}
+
+// text is the cell's full width-measurable text.
+func (c candidateCell) text() string { return c.head() + c.resetSuffix() }
 
 // addCandidateCell appends one window cell at its emphasis level (see
 // candidateRow): binding → severity-colored + bold, counted → the plain
-// label/foreground palette, uncounted → muted and dim.
-func addCandidateCell(t *richText, cell candidateWindow) {
+// label/foreground palette, uncounted → muted and dim. The countdown follows as
+// its own segment so it can stay muted (and never bold) beside an emphasized
+// binding pct; it is dim only where its whole cell is. A cell with no countdown
+// appends nothing extra — richText.add drops empty text — so a row whose windows
+// carry no resets_at renders exactly as it did before countdowns existed.
+func addCandidateCell(t *richText, cell candidateCell) {
 	switch {
-	case cell.Binding:
-		t.add(candidateCellText(cell), segStyle{Fg: severityColorF(cell.Pct), Bold: true})
-	case cell.Counted:
-		t.addFg(cell.Label+" ", colMuted)
-		t.addFg(fmt.Sprintf("%.0f%%", cell.Pct), colForeground)
+	case cell.win.Binding:
+		t.add(cell.head(), segStyle{Fg: severityColorF(cell.win.Pct), Bold: true})
+		t.addFg(cell.resetSuffix(), colMuted)
+	case cell.win.Counted:
+		t.addFg(cell.win.Label+" ", colMuted)
+		t.addFg(fmt.Sprintf("%.0f%%", cell.win.Pct), colForeground)
+		t.addFg(cell.resetSuffix(), colMuted)
 	default:
-		t.add(candidateCellText(cell), segStyle{Fg: colMuted, Dim: true})
+		t.add(cell.head(), segStyle{Fg: colMuted, Dim: true})
+		t.add(cell.resetSuffix(), segStyle{Fg: colMuted, Dim: true})
 	}
 }
 
-// dropCandidateCell drops the least informative still-shown cell — the rightmost
-// uncounted one, else the rightmost non-binding counted one — and reports whether
-// it dropped anything. The binding cell is never a candidate for dropping.
-func dropCandidateCell(cells []candidateWindow, keep []bool) bool {
-	for _, counted := range []bool{false, true} {
+// candidateShedSteps is the candidate row's width ladder, in the exact order a
+// row gives ground (DESIGN A18). A countdown is supporting detail, so it always
+// goes before the cell carrying it, and a whole class goes before the next more
+// informative one:
+//
+//	(a) countdowns of UNCOUNTED cells        (b) UNCOUNTED cells
+//	(c) countdowns of COUNTED NON-BINDING    (d) COUNTED non-binding cells
+//	(e) the BINDING cell's countdown
+//
+// (c) reaches only non-binding cells — the binding cell is itself a counted one,
+// and its countdown is held back to (e), the last rung.
+//
+// The binding cell's label+pct is deliberately absent: it is the ranking key and
+// survives every step (a row too narrow even for it clips the email, then falls
+// through to the whole-line truncRich guard).
+var candidateShedSteps = []struct {
+	binding   bool // the step touches the binding cell (else a non-binding one)
+	counted   bool // ... of this class, when not the binding cell
+	countdown bool // drop just the countdown (else the whole cell)
+}{
+	{counted: false, countdown: true},
+	{counted: false},
+	{counted: true, countdown: true},
+	{counted: true},
+	{binding: true, countdown: true},
+}
+
+// shedCandidateCell performs the single next reduction of the width ladder —
+// class-major (candidateShedSteps), rightmost-first within a class — and reports
+// whether anything was left to shed. Callers re-measure after each step, so a row
+// only ever loses as much as it must.
+func shedCandidateCell(cells []candidateCell) bool {
+	for _, step := range candidateShedSteps {
 		for i := len(cells) - 1; i >= 0; i-- {
-			if keep[i] && !cells[i].Binding && cells[i].Counted == counted {
-				keep[i] = false
+			c := &cells[i]
+			if !c.shown || c.win.Binding != step.binding {
+				continue
+			}
+			if !step.binding && c.win.Counted != step.counted {
+				continue
+			}
+			if !step.countdown {
+				c.shown = false
+				return true
+			}
+			if c.showReset {
+				c.showReset = false
 				return true
 			}
 		}
@@ -787,17 +867,12 @@ func (a *autoScreen) footerBindings(m *Model) []footerBinding {
 
 func (a *autoScreen) view(m *Model) string {
 	inner := panelWidth(m)
-	// A resize changes what fits on a candidate row (which window cells survive,
-	// whether the email clips), and the panel is otherwise only rebuilt on the poll
-	// cadence — re-lay it out here the moment the width moves (DESIGN A18).
-	if inner != a.candidatesWidth {
-		a.rebuildCandidates(m, inner)
-	}
 	// Pinned chrome: the active account card, the mode badge + summary line, and
 	// the ranked candidates. Only the event log below flexes (09§4: the RichLog
 	// is the screen's one scrollable region; everything above it stays put).
 	var chrome richText
-	chrome.addText(accountsPanelText(m.snapshot, inner, false, m.thresholdPct, m.nowSeconds()))
+	now := m.nowSeconds()
+	chrome.addText(accountsPanelText(m.snapshot, inner, false, m.thresholdPct, now))
 	chrome.addPlain("\n\n")
 	if a.dryRun || a.engine == nil {
 		chrome.add(" DRY-RUN ", segStyle{Fg: colSevWarn, Bold: true})
@@ -807,7 +882,13 @@ func (a *autoScreen) view(m *Model) string {
 	chrome.addPlain("  ")
 	chrome.addText(a.summaryText())
 	chrome.addPlain("\n")
-	chrome.addText(a.candidates)
+	// The ranked panel is built fresh on every render, at the CURRENT width and
+	// the CURRENT clock, rather than cached from the last poll (DESIGN A18): a
+	// resize changes which window cells survive on a row, and every cell's reset
+	// countdown is live, so a cached panel would both wrap after a narrowing and
+	// show countdowns as old as the poll cadence. Building it costs one pass over
+	// the snapshot the same render already walks for the account card.
+	chrome.addText(a.candidatesText(m.snapshot, inner, now))
 	chromeLines := strings.Split(chrome.render(), "\n")
 
 	// Event log (flex): the full history is kept in a.log; only the newest lines

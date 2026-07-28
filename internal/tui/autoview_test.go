@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -87,7 +88,7 @@ func candidatesSnapshot() *reporting.AccountsSnapshot {
 func TestCandidatesTextBestOrder(t *testing.T) {
 	a := newAutoScreen()
 	a.settings = settings.Default() // Strategy "best"
-	out := a.candidatesText(candidatesSnapshot(), 0).plain()
+	out := a.candidatesText(candidatesSnapshot(), 0, testNow).plain()
 	// binding pct ascending; the two 100% accounts tie on pct -> account number
 	// asc (5 before 6); sentinel (998) then usage-unknown (999) sort last.
 	assertOrder(t, out, []string{"acc4@x", "acc2@x", "acc3@x", "acc5@x", "acc6@x", "acc7@x", "acc8@x"})
@@ -97,7 +98,7 @@ func TestCandidatesTextSoonestResetOrder(t *testing.T) {
 	a := newAutoScreen()
 	a.settings = settings.Default()
 	a.settings.Strategy = "soonest-reset"
-	out := a.candidatesText(candidatesSnapshot(), 0).plain()
+	out := a.candidatesText(candidatesSnapshot(), 0, testNow).plain()
 	// Every headroom account here is below the threshold, so: tier 0
 	// (below-threshold, known renewal), renewal asc: 3 (07-19) before 2 (07-20);
 	// tier 1 (below-threshold, unknown renewal): 4; tier 3 (at limit), known
@@ -133,7 +134,7 @@ func TestCandidatesTextSoonestResetThresholdTier(t *testing.T) {
 			candAcct("7", "acc7@x", nil),
 		},
 	}
-	out := a.candidatesText(snap, 0).plain()
+	out := a.candidatesText(snap, 0, testNow).plain()
 	// tier 0: acc3; tier 1: acc4; tier 2 (over threshold): acc2 despite renewing
 	// earliest; tier 3: acc5; tier 4: acc6 sentinel; tier 5: acc7 usage-unknown.
 	assertOrder(t, out, []string{"acc3@x", "acc4@x", "acc2@x", "acc5@x", "acc6@x", "acc7@x"})
@@ -172,7 +173,7 @@ func TestCandidatesTextExcludesDisabled(t *testing.T) {
 			a := newAutoScreen()
 			a.settings = settings.Default() // threshold 90
 			a.settings.Strategy = tc.strategy
-			out := a.candidatesText(snap, 0).plain()
+			out := a.candidatesText(snap, 0, testNow).plain()
 			if strings.Contains(out, "disabled@x") {
 				t.Fatalf("disabled account (best usage) must never appear in the panel:\n%s", out)
 			}
@@ -200,7 +201,7 @@ func TestCandidatesTextConsumesRotationEligible(t *testing.T) {
 	}
 	a := newAutoScreen()
 	a.settings = settings.Default()
-	out := a.candidatesText(snap, 0).plain()
+	out := a.candidatesText(snap, 0, testNow).plain()
 	for _, email := range []string{"ineligible@x", "unswitchable@x"} {
 		if strings.Contains(out, email) {
 			t.Fatalf("%s is not rotation-eligible and must not appear in the panel:\n%s", email, out)
@@ -256,7 +257,7 @@ func TestCandidatesTextMarksQuarantined(t *testing.T) {
 			a.settings.Strategy = strategy
 			a.refreshQuarantine(m) // the live read seam: dir/autoswitch_state.json
 
-			rt := a.candidatesText(snap, 0)
+			rt := a.candidatesText(snap, 0, testNow)
 			out := rt.plain()
 			if !strings.Contains(out, "quarantined (invalid_grant)") {
 				t.Fatalf("panel must label the quarantined slot with its reason:\n%s", out)
@@ -289,7 +290,7 @@ func TestCandidatesTextMarksQuarantined(t *testing.T) {
 
 		baseline := newAutoScreen() // quarantined stays nil: the pre-feature path
 		baseline.settings = settings.Default()
-		if got, want := withRead.candidatesText(snap, 0).render(), baseline.candidatesText(snap, 0).render(); got != want {
+		if got, want := withRead.candidatesText(snap, 0, testNow).render(), baseline.candidatesText(snap, 0, testNow).render(); got != want {
 			t.Fatalf("empty quarantine must render byte-identical to today's:\n got=%q\nwant=%q", got, want)
 		}
 	})
@@ -346,8 +347,15 @@ func oneRowPanel(t *testing.T, lastGood map[string]any, model *string, width int
 }
 
 // oneRowPanelFor is oneRowPanel with the candidate's email spelled out (the width
-// tests need an email long enough to clip).
+// tests need an email long enough to clip), rendered against the frozen testNow.
 func oneRowPanelFor(t *testing.T, email string, lastGood map[string]any, model *string, width int) richText {
+	t.Helper()
+	return oneRowPanelAt(t, email, lastGood, model, width, testNow)
+}
+
+// oneRowPanelAt is oneRowPanelFor with the render clock spelled out, for the rows
+// whose window cells carry live reset countdowns.
+func oneRowPanelAt(t *testing.T, email string, lastGood map[string]any, model *string, width int, now float64) richText {
 	t.Helper()
 	a := newAutoScreen()
 	a.settings = settings.Default()
@@ -355,7 +363,7 @@ func oneRowPanelFor(t *testing.T, email string, lastGood map[string]any, model *
 	return a.candidatesText(&reporting.AccountsSnapshot{
 		ActiveNumber: "1",
 		Accounts:     []reporting.AccountSnapshot{candAcct("2", email, lastGood)},
-	}, width)
+	}, width, now)
 }
 
 // cellEmphasis classifies how a row rendered one window cell, by the styling
@@ -505,6 +513,161 @@ func TestCandidateRowBindingCellIsSeverityColored(t *testing.T) {
 	}
 }
 
+// -- per-window reset countdowns (DESIGN A18) --------------------------------
+
+// resetRow builds the standard countdown fixture: 5h 12% resetting in 3h 20m, 7d
+// 88% (the binding window) in 2d 4h, and an uncounted Fable 40% in 6d, all
+// relative to testNow.
+func resetRow(t *testing.T) map[string]any {
+	t.Helper()
+	lg := windows(12, 88, scopedWindow{"Fable", 40})
+	withReset(t, lg, "five_hour", timeAheadISO(testNow, 3*3600+20*60))
+	withReset(t, lg, "seven_day", timeAheadISO(testNow, 2*86400+4*3600))
+	withReset(t, lg, "Fable", timeAheadISO(testNow, 6*86400))
+	return lg
+}
+
+// panelRowPlain returns the single candidate row of a one-row panel, ANSI-free.
+func panelRowPlain(t *testing.T, rt richText) string {
+	t.Helper()
+	lines := strings.Split(rt.plain(), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("panel = %q, want exactly a header and one row", rt.plain())
+	}
+	return lines[1]
+}
+
+// cellSegs returns the styled segments of the cell labeled label: the run that
+// starts at the "<label> …" segment and ends before the next cell separator.
+func cellSegs(t *testing.T, rt richText, label string) []seg {
+	t.Helper()
+	for i, s := range rt.segs {
+		if !strings.HasPrefix(s.Text, label+" ") {
+			continue
+		}
+		out := []seg{s}
+		for _, next := range rt.segs[i+1:] {
+			if next.Text == candidateSep || strings.Contains(next.Text, "\n") {
+				break
+			}
+			out = append(out, next)
+		}
+		return out
+	}
+	t.Fatalf("no cell labeled %q in %q", label, rt.plain())
+	return nil
+}
+
+// cellCountdown returns the countdown segment of the cell labeled label, or a
+// zero seg when the cell shows no parenthetical.
+func cellCountdown(t *testing.T, rt richText, label string) seg {
+	t.Helper()
+	segs := cellSegs(t, rt, label)
+	last := segs[len(segs)-1]
+	if !strings.HasPrefix(last.Text, " (") {
+		return seg{}
+	}
+	return last
+}
+
+// TestCandidateRowShowsWindowResetCountdowns fixes the row's second question: a
+// cell says how used a window is AND when it frees up, as "<label> <pct>%
+// (resets …)", one cell per window. The countdown is derived LIVE from that
+// window's resets_at against the render clock — never read back from a stored
+// countdown string, which drifts as a measurement ages (09§12) — so advancing
+// only the clock counts every cell down.
+func TestCandidateRowShowsWindowResetCountdowns(t *testing.T) {
+	lg := resetRow(t)
+	const want = "5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h) · Fable 40% (resets 6d)"
+	if row := panelRowPlain(t, oneRowPanelFor(t, "acc2@x", lg, nil, 100)); !strings.HasSuffix(row, want) {
+		t.Errorf("row = %q, want it to end with %q", row, want)
+	}
+	// One hour later, from the very same fixture: only the clock moved.
+	const later = "5h 12% (resets 2h 20m) · 7d 88% (resets 2d 3h) · Fable 40% (resets 5d 23h)"
+	if row := panelRowPlain(t, oneRowPanelAt(t, "acc2@x", lg, nil, 100, testNow+3600)); !strings.HasSuffix(row, later) {
+		t.Errorf("row an hour later = %q, want it to end with %q", row, later)
+	}
+}
+
+// TestCandidateRowCountdownFallbacks fixes the two ends of the countdown: an
+// elapsed reset keeps the wording the rest of the TUI already uses for that case
+// ("resets now", never a new phrase), and a window with no usable resets_at shows
+// NO parenthetical at all — its cell renders exactly as it did before countdowns
+// existed, rather than inventing "unknown".
+func TestCandidateRowCountdownFallbacks(t *testing.T) {
+	// The baseline: a fixture with no resets_at key at all.
+	baseline := oneRowPanelFor(t, "acc2@x", windows(12, 88), nil, 100)
+	for _, c := range []struct {
+		name     string
+		resetsAt string
+		want     string
+	}{
+		{"ahead", timeAheadISO(testNow, 45*60), "5h 12% · 7d 88% (resets 45m)"},
+		{"elapsed", timeAheadISO(testNow, -100), "5h 12% · 7d 88% (resets now)"},
+		{"empty", "", "5h 12% · 7d 88%"},
+		{"unparseable", "not-a-date", "5h 12% · 7d 88%"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lg := withReset(t, windows(12, 88), "seven_day", c.resetsAt)
+			rt := oneRowPanelFor(t, "acc2@x", lg, nil, 100)
+			if row := panelRowPlain(t, rt); !strings.HasSuffix(row, c.want) {
+				t.Errorf("row = %q, want it to end with %q", row, c.want)
+			}
+			if c.want != "5h 12% · 7d 88%" {
+				return
+			}
+			// An unusable reset changes NOTHING about the row, down to the styling.
+			if got, want := rt.render(), baseline.render(); got != want {
+				t.Errorf("row with an unusable resets_at renders %q, want the "+
+					"no-reset row %q byte for byte", got, want)
+			}
+		})
+	}
+}
+
+// TestCandidateCellCountdownEmphasis fixes how a countdown is weighted: it rides
+// its own cell's level, so an uncounted cell's countdown stays dim, but it is
+// NEVER bold — inside the binding cell the pct is the emphasized figure and the
+// countdown is muted supporting detail, exactly as the mini account row renders
+// its own "(resets …)" suffix (09§5.5). The three cell levels themselves are
+// unchanged: cellEmphasis must still classify every cell.
+func TestCandidateCellCountdownEmphasis(t *testing.T) {
+	rt := oneRowPanelFor(t, "acc2@x", resetRow(t), nil, 100)
+	for _, c := range []struct {
+		label string
+		level string
+		text  string
+		style segStyle
+	}{
+		{"7d", "binding", " (resets 2d 4h)", segStyle{Fg: colMuted}},
+		{"5h", "counted", " (resets 3h 20m)", segStyle{Fg: colMuted}},
+		{"Fable", "uncounted", " (resets 6d)", segStyle{Fg: colMuted, Dim: true}},
+	} {
+		t.Run(c.label, func(t *testing.T) {
+			if got := cellEmphasis(t, rt, c.label); got != c.level {
+				t.Errorf("%s cell emphasis = %q, want %q (row %q)", c.label, got, c.level, rt.plain())
+			}
+			got := cellCountdown(t, rt, c.label)
+			if got.Text != c.text {
+				t.Fatalf("%s countdown = %q, want %q", c.label, got.Text, c.text)
+			}
+			if got.Style != c.style {
+				t.Errorf("%s countdown style = %+v, want %+v", c.label, got.Style, c.style)
+			}
+		})
+	}
+	// The binding cell keeps its own emphasis on the number itself.
+	if head := cellSegs(t, rt, "7d")[0]; head.Text != "7d 88%" ||
+		head.Style != (segStyle{Fg: severityColorF(88), Bold: true}) {
+		t.Errorf("binding head = %q %+v, want %q severity-colored + bold", head.Text, head.Style, "7d 88%")
+	}
+	for _, s := range rt.segs {
+		if strings.HasPrefix(s.Text, " (resets ") && s.Style.Bold {
+			t.Errorf("countdown %q is bold; the pct is the emphasized figure", s.Text)
+		}
+	}
+}
+
 // TestUncountedScopedWindowNeverRanks fixes that an unmatched scoped window is
 // information only: listed on the row, but never part of the ranking key. The
 // same snapshot is ranked against a control with no scoped windows at all — the
@@ -529,16 +692,16 @@ func TestUncountedScopedWindowNeverRanks(t *testing.T) {
 	}
 	a := newAutoScreen()
 	a.settings = settings.Default() // autoswitch.model unset
-	out := a.candidatesText(withScoped, 80).plain()
+	out := a.candidatesText(withScoped, 80, testNow).plain()
 	assertOrder(t, out, []string{"acc2@x", "acc3@x"})
-	assertOrder(t, a.candidatesText(control, 80).plain(), []string{"acc2@x", "acc3@x"})
+	assertOrder(t, a.candidatesText(control, 80, testNow).plain(), []string{"acc2@x", "acc3@x"})
 	// Listed all the same, so the user can watch it fill before configuring it.
 	if !strings.Contains(out, "Fable 99%") {
 		t.Fatalf("an uncounted scoped window must still be listed:\n%s", out)
 	}
 	// Configured, the very same window counts — and reverses the ranking.
 	a.settings.Model = modelPtr("Fable")
-	assertOrder(t, a.candidatesText(withScoped, 80).plain(), []string{"acc3@x", "acc2@x"})
+	assertOrder(t, a.candidatesText(withScoped, 80, testNow).plain(), []string{"acc3@x", "acc2@x"})
 }
 
 // TestCandidatesHeaderNamesCountedAxis fixes the muted header suffix that
@@ -573,7 +736,7 @@ func TestCandidatesHeaderNamesCountedAxis(t *testing.T) {
 	// The empty state keeps the header (and its note) intact.
 	a := newAutoScreen()
 	a.settings = settings.Default()
-	out := a.candidatesText(&reporting.AccountsSnapshot{ActiveNumber: "1"}, 80).plain()
+	out := a.candidatesText(&reporting.AccountsSnapshot{ActiveNumber: "1"}, 80, testNow).plain()
 	if out != "Next best · counting 5h, 7d\n  no other switchable accounts" {
 		t.Errorf("empty-state panel = %q", out)
 	}
@@ -715,6 +878,131 @@ func TestCandidateRowDropOrder(t *testing.T) {
 	}
 }
 
+// TestCandidateCountdownDropOrder pins the direction of the within-class scan for
+// countdowns, the half TestCandidateRowDropOrder cannot see: with TWO droppable
+// cells in each class, the RIGHTMOST cell of a class loses its countdown first,
+// and a class gives up every one of its countdowns before it gives up a single
+// cell.
+func TestCandidateCountdownDropOrder(t *testing.T) {
+	// autoswitch.model = Opus: 5h/7d/Opus count, Fable and Haiku do not, and Opus
+	// (the highest counted pct) binds. Full row is 121 columns.
+	lg := windows(10, 20, scopedWindow{"Fable", 50}, scopedWindow{"Opus", 90}, scopedWindow{"Haiku", 60})
+	withReset(t, lg, "five_hour", timeAheadISO(testNow, 3600))
+	withReset(t, lg, "seven_day", timeAheadISO(testNow, 2*86400))
+	withReset(t, lg, "Fable", timeAheadISO(testNow, 3*86400))
+	withReset(t, lg, "Opus", timeAheadISO(testNow, 4*3600))
+	withReset(t, lg, "Haiku", timeAheadISO(testNow, 5*86400))
+	for _, tc := range []struct {
+		width int
+		step  string
+		want  string
+	}{
+		{121, "everything fits", "5h 10% (resets 1h) · 7d 20% (resets 2d) · Fable 50% (resets 3d) · Opus 90% (resets 4h) · Haiku 60% (resets 5d)"},
+		{120, "rightmost UNCOUNTED countdown: Haiku's, not Fable's", "5h 10% (resets 1h) · 7d 20% (resets 2d) · Fable 50% (resets 3d) · Opus 90% (resets 4h) · Haiku 60%"},
+		{108, "then the other uncounted countdown", "5h 10% (resets 1h) · 7d 20% (resets 2d) · Fable 50% · Opus 90% (resets 4h) · Haiku 60%"},
+		{96, "only then an uncounted cell, rightmost first", "5h 10% (resets 1h) · 7d 20% (resets 2d) · Fable 50% · Opus 90% (resets 4h)"},
+		{84, "then the other uncounted cell", "5h 10% (resets 1h) · 7d 20% (resets 2d) · Opus 90% (resets 4h)"},
+		{72, "then the rightmost COUNTED countdown: 7d's, not 5h's", "5h 10% (resets 1h) · 7d 20% · Opus 90% (resets 4h)"},
+		{60, "then the other counted countdown", "5h 10% · 7d 20% · Opus 90% (resets 4h)"},
+		{48, "only then a counted cell, rightmost first", "5h 10% · Opus 90% (resets 4h)"},
+		{39, "then the other counted cell", "Opus 90% (resets 4h)"},
+		{30, "the BINDING countdown goes last of all", "Opus 90%"},
+	} {
+		t.Run(fmt.Sprintf("width%d", tc.width), func(t *testing.T) {
+			rt := oneRowPanelAt(t, "a@x", lg, modelPtr("Opus"), tc.width, testNow)
+			assertNoWrap(t, rt, tc.width)
+			if row := panelRowPlain(t, rt); !strings.HasSuffix(row, tc.want) {
+				t.Errorf("at width %d (%s) row = %q, want it to end with %q",
+					tc.width, tc.step, row, tc.want)
+			}
+		})
+	}
+}
+
+// TestCandidateRowWidthLadderWithCountdowns fixes the full width ladder now that
+// a cell carries a countdown: countdowns are supporting detail, so each class
+// loses its countdowns before it loses its cells, and the whole ladder runs
+// least-informative first —
+//
+//	(a) uncounted countdowns, (b) uncounted cells, (c) counted countdowns,
+//	(d) counted non-binding cells, (e) the binding countdown, (f) the email,
+//	(g) the whole-line guard
+//
+// — rightmost first within each class, one step at a time, so a row only ever
+// gives up as much as the width demands. The binding cell's label+pct is the
+// ranking key and is on no rung of the ladder.
+func TestCandidateRowWidthLadderWithCountdowns(t *testing.T) {
+	lg := resetRow(t)
+	const email = "a@x"
+	// "   2  a@x  " + the cells below: 81 columns with everything shown.
+	const (
+		full  = "5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h) · Fable 40% (resets 6d)"
+		stepA = "5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h) · Fable 40%"
+		stepB = "5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h)"
+		stepC = "5h 12% · 7d 88% (resets 2d 4h)"
+		stepD = "7d 88% (resets 2d 4h)"
+		stepE = "7d 88%"
+	)
+	cases := []struct {
+		width   int
+		step    string
+		want    string
+		clipped bool // the email has given ground too
+	}{
+		{100, "everything fits", full, false},
+		{81, "the exact width of the whole row", full, false},
+		{80, "(a) the UNCOUNTED cell's countdown goes first", stepA, false},
+		{69, "(a) holds until the row overflows again", stepA, false},
+		{68, "(b) then the UNCOUNTED cell itself", stepB, false},
+		{57, "(b) holds", stepB, false},
+		{56, "(c) then the COUNTED non-binding cell's countdown", stepC, false},
+		{41, "(c) holds", stepC, false},
+		{40, "(d) then the COUNTED non-binding cell", stepD, false},
+		{32, "(d) holds", stepD, false},
+		{31, "(e) then the BINDING cell's countdown — last of the cell detail", stepE, false},
+		{17, "(e) holds", stepE, false},
+		{16, "(f) only then does the email clip", stepE, true},
+		{15, "(f) down to the bare ellipsis", stepE, true},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("width%d", tc.width), func(t *testing.T) {
+			rt := oneRowPanelAt(t, email, lg, nil, tc.width, testNow)
+			assertNoWrap(t, rt, tc.width)
+			row := panelRowPlain(t, rt)
+			if !strings.HasSuffix(row, tc.want) {
+				t.Errorf("at width %d (%s) row = %q, want it to end with %q",
+					tc.width, tc.step, row, tc.want)
+			}
+			if got := strings.Contains(row, email); got == tc.clipped {
+				t.Errorf("at width %d (%s) row = %q, email clipped = %v, want %v",
+					tc.width, tc.step, row, !got, tc.clipped)
+			}
+			if tc.clipped && !strings.Contains(row, footerEllipse) {
+				t.Errorf("at width %d the clipped email carries no ellipsis: %q", tc.width, row)
+			}
+		})
+	}
+	// (g) Narrower than the irreducible row (slot + bare ellipsis + binding cell),
+	// the whole line is cut — a prefix marked with the ellipsis, never a fold.
+	whole := panelRowPlain(t, oneRowPanelAt(t, email, lg, nil, 15, testNow))
+	for width := 14; width >= 1; width-- {
+		rt := oneRowPanelAt(t, email, lg, nil, width, testNow)
+		assertNoWrap(t, rt, width)
+		row := panelRowPlain(t, rt)
+		if !strings.HasSuffix(row, footerEllipse) {
+			t.Errorf("at width %d the row %q is cut with no ellipsis", width, row)
+		}
+		if cut := strings.TrimSuffix(row, footerEllipse); !strings.HasPrefix(whole, cut) {
+			t.Errorf("at width %d the row %q is not a prefix of %q — the guard must cut, "+
+				"never reword or reorder", width, row, whole)
+		}
+	}
+	// No width, at any point on the ladder, may wrap a row.
+	for width := 1; width <= 100; width++ {
+		assertNoWrap(t, oneRowPanelAt(t, email, lg, nil, width, testNow), width)
+	}
+}
+
 // -- every row shape fits the width (DESIGN A18) -----------------------------
 
 // panelShapesSnapshot spans every row shape the panel emits: a readable usage
@@ -736,10 +1024,17 @@ func panelShapesSnapshot() *reporting.AccountsSnapshot {
 // panelShapes renders the every-shape panel at width, slot 3 quarantined.
 func panelShapes(t *testing.T, width int) richText {
 	t.Helper()
+	return panelShapesOf(t, panelShapesSnapshot(), width)
+}
+
+// panelShapesOf renders any snapshot with slot 3 quarantined, at the frozen
+// testNow — so a fixture whose windows carry resets_at renders live countdowns.
+func panelShapesOf(t *testing.T, snap *reporting.AccountsSnapshot, width int) richText {
+	t.Helper()
 	a := newAutoScreen()
 	a.settings = settings.Default()
 	a.quarantined = map[string]string{"3": "invalid_grant"}
-	return a.candidatesText(panelShapesSnapshot(), width)
+	return a.candidatesText(snap, width, testNow)
 }
 
 // panelRow returns the rendered, ANSI-free panel line for a slot.
@@ -799,7 +1094,50 @@ func TestCandidatesPanelNeverWrapsAtAnyWidth(t *testing.T) {
 	a := newAutoScreen()
 	a.settings = settings.Default()
 	for width := 1; width <= 60; width++ {
-		assertNoWrap(t, a.candidatesText(&reporting.AccountsSnapshot{ActiveNumber: "1"}, width), width)
+		assertNoWrap(t, a.candidatesText(&reporting.AccountsSnapshot{ActiveNumber: "1"}, width, testNow), width)
+	}
+}
+
+// panelShapesResetSnapshot is panelShapesSnapshot with live resets: slot 2's 5h
+// and 7d windows reset at known times while its Fable window carries none (so one
+// cell of a countdown row shows no parenthetical), and slot 3 — the quarantined
+// row — carries a reset its label must swallow along with its usage. The
+// sentinel and usage-unknown rows carry no windows at all.
+func panelShapesResetSnapshot(t *testing.T) *reporting.AccountsSnapshot {
+	t.Helper()
+	snap := panelShapesSnapshot()
+	withReset(t, snap.Accounts[0].Usage.LastGood, "five_hour", timeAheadISO(testNow, 3*3600+20*60))
+	withReset(t, snap.Accounts[0].Usage.LastGood, "seven_day", timeAheadISO(testNow, 2*86400+4*3600))
+	withReset(t, snap.Accounts[1].Usage.LastGood, "seven_day", timeAheadISO(testNow, 45*60))
+	return snap
+}
+
+// TestCandidatesPanelWithCountdownsNeverWrapsAtAnyWidth is the never-wrap
+// contract re-measured with countdowns on the rows, on the RENDERED panel with
+// every row shape present at once: a countdown lengthens exactly the rows that
+// have windows, and the shed ladder must absorb that at every width without ever
+// pushing a line past the budget (a row whose leading newline slipped inside a
+// styled segment would pad the line ABOVE it, which only a multi-row panel can
+// catch).
+func TestCandidatesPanelWithCountdownsNeverWrapsAtAnyWidth(t *testing.T) {
+	snap := panelShapesResetSnapshot(t)
+	for width := 1; width <= 140; width++ {
+		assertNoWrap(t, panelShapesOf(t, snap, width), width)
+	}
+	// Wide enough for everything: each window that knows its reset shows it, and
+	// the one that does not (Fable) shows no parenthetical at all.
+	rt := panelShapesOf(t, snap, 140)
+	if row := panelRow(t, rt, "2"); !strings.HasSuffix(row,
+		"5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h) · Fable 40%") {
+		t.Errorf("usage row = %q, want a countdown on exactly the windows that have one", row)
+	}
+	// The rows the panel cannot rank by usage carry no window cells, so they carry
+	// no countdown either — quarantined (whose 7d reset the label swallows),
+	// sentinel, usage-unknown.
+	for _, number := range []string{"3", "4", "5"} {
+		if row := panelRow(t, rt, number); strings.Contains(row, "(resets") {
+			t.Errorf("windowless row %s = %q, want no countdown", number, row)
+		}
 	}
 }
 
@@ -887,6 +1225,68 @@ func TestAutoViewRelaysCandidatesOnResize(t *testing.T) {
 	}
 	if !strings.Contains(row, "7d 88%") {
 		t.Fatalf("row after resize = %q, want the binding cell intact", row)
+	}
+}
+
+// TestAutoViewBuildsCandidatesEveryRender fixes the freshness contract behind the
+// countdowns (DESIGN A18): the panel is NOT cached between polls, it is rebuilt
+// by every view() from the current snapshot and the Model's render clock. A
+// cached panel would let a countdown sit as stale as the poll cadence, saying
+// "resets 2h 13m" long after it became 45m.
+//
+// Both halves are asserted against the REAL clock, because that is the seam the
+// live screen uses: the row must read the countdown m.nowSeconds() implies (a
+// renderer that passed a zero/frozen now would print a wildly different one), and
+// a second render — with no poll, no resize, no onSnapshot in between — must pick
+// up the newer reset immediately.
+// TestAutoViewRendersBeforeTheFirstSnapshot fixes that the screen is renderable
+// with nothing polled yet. Building the panel per render puts a nil snapshot on
+// view()'s path — m.snapshot stays nil until the first refresh lands, and that
+// pass does keychain reads and can fetch usage over the network, so the window
+// is a real one every time the screen is opened.
+func TestAutoViewRendersBeforeTheFirstSnapshot(t *testing.T) {
+	m := newTestModel(&fakeFacade{})
+	m.height, m.width = 24, 100
+	a := newAutoScreen()
+	a.settings = settings.Default()
+	a.dryRun = true
+	if m.snapshot != nil {
+		t.Fatalf("fixture must start unpolled, got %+v", m.snapshot)
+	}
+	out := a.view(m) // must not panic
+	if strings.Contains(out, "Next best") {
+		t.Errorf("panel rendered with no snapshot:\n%s", out)
+	}
+	if rt := a.candidatesText(nil, 100, testNow); len(rt.segs) != 0 {
+		t.Errorf("candidatesText(nil) = %+v, want empty", rt.segs)
+	}
+}
+
+func TestAutoViewBuildsCandidatesEveryRender(t *testing.T) {
+	m := newTestModel(&fakeFacade{})
+	m.height, m.width = 24, 100
+	a := newAutoScreen()
+	a.settings = settings.Default()
+	a.dryRun = true
+
+	realNow := float64(time.Now().UnixNano()) / 1e9
+	// The 30s cushions keep the truncated countdown stable for the whole test.
+	lastGood := windows(12, 88)
+	withReset(t, lastGood, "seven_day", timeAheadISO(realNow, 2*3600+13*60+30))
+	m.snapshot = &reporting.AccountsSnapshot{
+		ActiveNumber: "1",
+		Accounts: []reporting.AccountSnapshot{
+			acct("1", "active@x.com", true, nil),
+			candAcct("2", "candidate.long@example.com", lastGood),
+		},
+	}
+	if row := viewLine(t, a.view(m), "candidate"); !strings.Contains(row, "7d 88% (resets 2h 13m)") {
+		t.Fatalf("row = %q, want the countdown the render clock implies", row)
+	}
+	// The window resets sooner than it used to; nothing else happens.
+	withReset(t, lastGood, "seven_day", timeAheadISO(realNow, 45*60+30))
+	if row := viewLine(t, a.view(m), "candidate"); !strings.Contains(row, "7d 88% (resets 45m)") {
+		t.Fatalf("row on the next render = %q, want the panel rebuilt (no cached countdown)", row)
 	}
 }
 
