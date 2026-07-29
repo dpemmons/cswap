@@ -366,7 +366,12 @@ type candidateRank struct {
 // number, so the reason a candidate ranks where it does is on the row (DESIGN
 // A18): the binding window is emphasized, the other counted windows stay
 // readable, and scoped windows autoswitch.model does not match are muted
-// information — see candidateRow. width is the column budget a row must fit in
+// information. The rows are laid out by the shared window table (table.go) —
+// column headers naming each window once, one line per candidate — which the
+// dashboard accounts monitor uses too, so a window reads the same way on both
+// surfaces. When the table cannot fit the terminal, the whole panel drops to
+// the per-row layout (candidateRow / candidateLabelRow), which narrows down to
+// a bare slot number at any width. width is the column budget a row must fit in
 // (a row never wraps); width <= 0 falls back to 80 columns, as footerText does.
 // now is the render clock in fractional Unix seconds, from which each window
 // cell's reset countdown is derived live (never a stored countdown string, 09§12).
@@ -382,7 +387,7 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int,
 	models := settings.ParseModelNames(a.settings.Model)
 	threshold := a.settings.Threshold // session-adjusted; same value the engine gets
 	var ranked []candidateRank
-	lines := map[string]richText{}
+	entries := map[string]candidateEntry{}
 	for _, acc := range snap.Accounts {
 		// Skip the active account and everything the engine's candidate set
 		// excludes — non-switchable (no stored creds/config) and disabled slots,
@@ -393,7 +398,7 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int,
 			continue
 		}
 		pct := bindingPct(acc.Usage.LastGood, models)
-		var entry richText
+		entry := candidateEntry{number: acc.Number, email: acc.Email}
 		switch {
 		case a.isQuarantined(acc.Number):
 			// The engine quarantined this slot (invalid_grant / identity conflict)
@@ -401,19 +406,16 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int,
 			// its cached usage may look healthy. Keep the row but label it and rank
 			// it into the non-viable tail (DESIGN A18). Quarantine takes precedence
 			// over the sentinel and usage cells below.
-			entry = candidateLabelRow(acc.Number, acc.Email,
-				quarantineLabel(a.quarantined[acc.Number]), colSevWarn, width)
+			entry.label, entry.color = quarantineLabel(a.quarantined[acc.Number]), colSevWarn
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 997.0, tier: 4})
 		case acc.Usage.Sentinel != "":
-			entry = candidateLabelRow(acc.Number, acc.Email,
-				sentinelLabel(acc.Usage.Sentinel), colMuted, width)
+			entry.label, entry.color = sentinelLabel(acc.Usage.Sentinel), colMuted
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 998.0, tier: 5})
 		case pct == nil:
-			entry = candidateLabelRow(acc.Number, acc.Email, "usage unknown", colMuted, width)
+			entry.label, entry.color = "usage unknown", colMuted
 			ranked = append(ranked, candidateRank{number: acc.Number, bestKey: 999.0, tier: 6})
 		default:
-			entry = candidateRow(acc.Number, acc.Email,
-				candidateWindows(acc.Usage.LastGood, models), width, now)
+			entry.windows = candidateWindows(acc.Usage.LastGood, models)
 			r := candidateRank{number: acc.Number, bestKey: *pct, pct: *pct,
 				renewal: renewalTS(acc.Usage.LastGood, models)}
 			switch {
@@ -428,7 +430,7 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int,
 			}
 			ranked = append(ranked, r)
 		}
-		lines[acc.Number] = entry
+		entries[acc.Number] = entry
 	}
 
 	var head richText
@@ -446,10 +448,119 @@ func (a *autoScreen) candidatesText(snap *reporting.AccountsSnapshot, width int,
 		less = candidateLessSoonest
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return less(ranked[i], ranked[j]) })
+	ordered := make([]candidateEntry, 0, len(ranked))
 	for _, r := range ranked {
-		out.addText(lines[r.number])
+		ordered = append(ordered, entries[r.number])
+	}
+
+	// Ranked rows, laid out by the shared window table (table.go) — the same
+	// layout the accounts monitor uses, so a window reads the same way on both
+	// surfaces. Ranking, order, the header note and every label are unchanged;
+	// only the layout is shared.
+	//
+	// BOTH layouts are built at this width and PRICED, and the panel draws the one
+	// that displays more (pickWindowTable): the table's columns are the union
+	// across candidates, so on a roster whose accounts report different scoped
+	// models it can state the same figures in strictly more columns and pay for
+	// them with the countdowns candidateRow still affords. Where it does, the
+	// per-row layout is drawn instead. The choice is TOTAL — a table for some rows
+	// and per-row layout for others would be worse than either — and it subsumes
+	// the width below which no table exists at all.
+	rows := make([]richText, 0, len(ordered))
+	for _, e := range ordered {
+		rows = append(rows, e.rowText(width, now))
+	}
+	// PRICED at the widest spelling every countdown's grammar allows, never at
+	// this frame's: the bar the table clears must be the same bar on the next
+	// frame, or the panel rearranges itself while the user watches. The lines
+	// above are the ones DRAWN, spelled live, and they state at least this much.
+	perRow := func(at int) layoutScore {
+		var s layoutScore
+		for _, e := range ordered {
+			_, score := e.rowPriced(at, widestClock())
+			s = s.plus(score)
+		}
+		return s
+	}
+	if table, ok := pickWindowTable(candidateTableRows(ordered), width, now,
+		candidateTableOpts, perRow); ok {
+		if len(table.Header.segs) > 0 {
+			out.addText(candidateRowText(table.Header, width))
+		}
+		for _, line := range table.Lines {
+			out.addText(candidateRowText(line, width))
+		}
+		return out
+	}
+	for _, line := range rows {
+		out.addText(line)
 	}
 	return out
+}
+
+// candidateEntry is one ranked row's content, independent of how it is laid
+// out: the shared table renders it as a WINDOW row (windows) or a SPAN row
+// (label), and the per-row fallback renders exactly the same content through
+// candidateRow / candidateLabelRow.
+type candidateEntry struct {
+	number  string
+	email   string
+	windows []candidateWindow
+	label   string // "" → a readable usage row; else why the engine cannot pick it
+	color   string
+}
+
+// candidateTableOpts is the panel's slot-cell chrome: rows indented two columns
+// (candidateNumber's margin) and the slot number in the plain foreground. Its
+// headers keep a whole syllable (headerFloor), because this panel's own per-row
+// fallback prints every model name in full — a header cut below that would name
+// a window less well here than the layout it replaces.
+//
+// Its policy is this panel's own per-row layout, which is the bar the table is
+// held to: candidateRow holds the BINDING cell's countdown back to its last rung
+// (candidateShedSteps), so the table does too; and it DISCARDS an exhausted
+// uncounted figure at every width, so pinning one here would spend the whole
+// panel's table protecting a figure the layout it replaces throws away.
+var candidateTableOpts = tableOpts{
+	indent: 2, slotStyle: segStyle{Fg: colForeground}, headerFloor: 4,
+	policy: tablePolicy{PinExhausted: false, KeepBindingCountdown: true},
+}
+
+// candidateTableRows projects the ranked entries onto shared-table rows, in
+// ranked order. A labeled entry becomes a SPAN row carrying its label in the
+// label's own color; a readable one becomes a WINDOW row. The two shapes are
+// built through the row constructors, so an entry carrying both a label and
+// windows can never render as some blend of them.
+func candidateTableRows(entries []candidateEntry) []tableRow {
+	rows := make([]tableRow, 0, len(entries))
+	for _, e := range entries {
+		var label richText
+		label.addFg(e.email, colForeground)
+		if e.label != "" {
+			rows = append(rows, newSpanRow(e.number, label, e.label, e.color, false))
+			continue
+		}
+		rows = append(rows, newWindowRow(e.number, label, e.windows, false))
+	}
+	return rows
+}
+
+// rowText renders the entry through the panel's per-row layout, the one that
+// survives any width (DESIGN A18).
+func (e candidateEntry) rowText(width int, now float64) richText {
+	line, _ := e.rowPriced(width, liveClock(now))
+	return line
+}
+
+// rowPriced is rowText with what the row DISPLAYS, which is what the panel holds
+// the shared table against at the same width (layoutScore). clk spells the
+// countdowns: live for the line that is drawn, widest for the bar, which a
+// labeled row is indifferent to — it states a reason and no reset at all.
+func (e candidateEntry) rowPriced(width int, clk renderClock) (richText, layoutScore) {
+	if e.label != "" {
+		return candidateLabelRowPriced(e.number, e.email, e.label, e.color, width)
+	}
+	return candidateRowPriced(e.number, e.email, e.windows, width, clk)
 }
 
 // countingNote names the decision axis the panel ranks on, once, in the header,
@@ -498,6 +609,18 @@ func candidateRowText(body richText, width int) richText {
 	return *t.addText(truncRich(body, width))
 }
 
+// pricedRowText is candidateRowText over a PRICED body: the same row break and
+// the same fit to width, reporting what survived that fit (layoutScore). The
+// panel prices its per-row layout on the clipped line and not on the one it
+// meant to draw, because a figure the last-resort clip took away is one this
+// layout does not display either.
+func pricedRowText(body pricedText, width int) (richText, layoutScore) {
+	fitted, score := body.fit(width)
+	var t richText
+	t.addPlain("\n")
+	return *t.addText(fitted), score
+}
+
 // candidateLabelRow renders a candidate the panel cannot rank by usage — a
 // quarantined, sentinel or usage-unknown slot: slot number, email, then the
 // label saying why the engine will not pick it.
@@ -507,6 +630,15 @@ func candidateRowText(body richText, width int) richText {
 // label — the reason the row is on the panel at all — truncates with an ellipsis
 // only as the last resort. The label text itself is never reworded to fit.
 func candidateLabelRow(number, email, label, color string, width int) richText {
+	line, _ := candidateLabelRowPriced(number, email, label, color, width)
+	return line
+}
+
+// candidateLabelRowPriced is candidateLabelRow with what the row DISPLAYS: the
+// columns of the reason that survived, and the columns of the email — the same
+// two quantities the shared table's SPAN row is priced on, so the panel can hold
+// one layout against the other at the same width.
+func candidateLabelRowPriced(number, email, label, color string, width int) (richText, layoutScore) {
 	head := candidateNumber(number)
 	fixed := lipgloss.Width(head) + lipgloss.Width(candidateGap)
 	shownEmail, shownLabel := email, label
@@ -520,12 +652,12 @@ func candidateLabelRow(number, email, label, color string, width int) richText {
 	if over := fixed + lipgloss.Width(shownEmail) + lipgloss.Width(label) - width; over > 0 {
 		shownLabel = clipText(label, lipgloss.Width(label)-over)
 	}
-	var body richText
-	body.addFg(head, colForeground)
-	body.addFg(shownEmail, colForeground)
-	body.addPlain(candidateGap)
-	body.addFg(shownLabel, color)
-	return candidateRowText(body, width)
+	var body pricedText
+	body.chrome(head, segStyle{Fg: colForeground})
+	body.identityRun(shownEmail, segStyle{Fg: colForeground}, lipgloss.Width(email))
+	body.chrome(candidateGap, segStyle{})
+	body.span(shownLabel, segStyle{Fg: color}, lipgloss.Width(label))
+	return pricedRowText(body, width)
 }
 
 // candidateRow renders a readable candidate's row: slot number, email, then one
@@ -535,13 +667,17 @@ func candidateLabelRow(number, email, label, color string, width int) richText {
 // "{label} {pct}% ({countdown})", the countdown derived live from that window's
 // resets_at against now (DESIGN A18; a window with no parseable resets_at simply
 // shows no parenthetical). The three emphasis levels carry the panel's contract
-// (Go-side extension, DESIGN A18):
+// (Go-side extension, DESIGN A18), the same one the shared table renders
+// (cellPctStyle) so a window reads alike above and below the flip:
 //
 //   - BINDING — the counted window with the highest pct: the number the row is
-//     ranked by and the one the engine decides on. Severity-colored and bold.
+//     ranked by and the one the engine decides on. Severity-colored and BOLD;
+//     the bold is what says "this is the one being acted on".
 //   - COUNTED but not binding — relevant on the configured autoswitch.model axis,
-//     so it could bind once it climbs. Readable, in the plain label/foreground
-//     palette.
+//     so it could bind once it climbs. Severity-colored too, behind its muted
+//     label: the color states what the figure MEANS, exactly as the account
+//     card's bars and the mini account line state it, so a counted window at 99%
+//     never reads as unremarkable for want of binding.
 //   - UNCOUNTED — a scoped window autoswitch.model does not match. It affects
 //     neither the ranking nor the engine's pick, so it is muted and dim: visible
 //     (the user must be able to watch a per-model window fill before configuring
@@ -556,8 +692,17 @@ func candidateLabelRow(number, email, label, color string, width int) richText {
 // nothing is left to shed the email clips, and a width too small even for the
 // binding cell clips the whole line rather than letting it fold.
 func candidateRow(number, email string, windows []candidateWindow, width int, now float64) richText {
+	line, _ := candidateRowPriced(number, email, windows, width, liveClock(now))
+	return line
+}
+
+// candidateRowPriced is candidateRow with what the row DISPLAYS: how many window
+// figures and how many reset countdowns survived its width ladder and the final
+// clip, and how much of the email. It is the bar the shared table is held to at
+// the same width (layoutScore.atLeast).
+func candidateRowPriced(number, email string, windows []candidateWindow, width int, clk renderClock) (richText, layoutScore) {
 	head := candidateNumber(number)
-	cells := candidateCells(windows, now)
+	cells := candidateCells(windows, clk)
 	rowWidth := func(email string) int {
 		w := lipgloss.Width(head) + lipgloss.Width(email)
 		shown := 0
@@ -586,23 +731,23 @@ func candidateRow(number, email string, windows []candidateWindow, width int, no
 		shown = clipText(email, budget)
 	}
 
-	var body richText
-	body.addFg(head, colForeground)
-	body.addFg(shown, colForeground)
+	var body pricedText
+	body.chrome(head, segStyle{Fg: colForeground})
+	body.identityRun(shown, segStyle{Fg: colForeground}, lipgloss.Width(email))
 	first := true
 	for _, cell := range cells {
 		if !cell.shown {
 			continue
 		}
 		if first {
-			body.addPlain(candidateGap)
+			body.chrome(candidateGap, segStyle{})
 			first = false
 		} else {
-			body.addFg(candidateSep, colTrack)
+			body.chrome(candidateSep, segStyle{Fg: colTrack})
 		}
 		addCandidateCell(&body, cell)
 	}
-	return candidateRowText(body, width)
+	return pricedRowText(body, width)
 }
 
 // candidateCell is one window cell as a row lays it out: the window itself, the
@@ -615,13 +760,16 @@ type candidateCell struct {
 	showReset bool
 }
 
-// candidateCells resolves each window's live countdown once per row (the reset
-// math is recomputed from resets_at at render time, 09§12) and starts every cell
-// fully shown — the width ladder takes detail away from there.
-func candidateCells(windows []candidateWindow, now float64) []candidateCell {
+// candidateCells resolves each window's countdown once per row (the reset math
+// is recomputed from resets_at at render time, 09§12) and starts every cell
+// fully shown — the width ladder takes detail away from there. clk is what the
+// countdown is spelled against: live when the row is DRAWN, and the widest
+// spelling its grammar allows when the row is only being PRICED as the bar the
+// shared table must clear (renderClock).
+func candidateCells(windows []candidateWindow, clk renderClock) []candidateCell {
 	cells := make([]candidateCell, 0, len(windows))
 	for _, w := range windows {
-		cd := candidateCountdown(w.ResetsAt, now)
+		cd := clk.resetText(w.ResetsAt)
 		cells = append(cells, candidateCell{win: w, countdown: cd, shown: true, showReset: cd != ""})
 	}
 	return cells
@@ -629,7 +777,7 @@ func candidateCells(windows []candidateWindow, now float64) []candidateCell {
 
 // head is the cell's utilization figure: "7d 88%" (09§5.5's grammar).
 func (c candidateCell) head() string {
-	return fmt.Sprintf("%s %.0f%%", c.win.Label, c.win.Pct)
+	return c.win.Label + " " + pctText(c.win.Pct)
 }
 
 // resetSuffix is the cell's countdown parenthetical (" (resets 2h 13m)"), or ""
@@ -645,24 +793,25 @@ func (c candidateCell) resetSuffix() string {
 func (c candidateCell) text() string { return c.head() + c.resetSuffix() }
 
 // addCandidateCell appends one window cell at its emphasis level (see
-// candidateRow): binding → severity-colored + bold, counted → the plain
-// label/foreground palette, uncounted → muted and dim. The countdown follows as
-// its own segment so it can stay muted (and never bold) beside an emphasized
-// binding pct; it is dim only where its whole cell is. A cell with no countdown
-// appends nothing extra — richText.add drops empty text — so a row whose windows
-// carry no resets_at renders exactly as it did before countdowns existed.
-func addCandidateCell(t *richText, cell candidateCell) {
+// candidateRow): every COUNTED figure carries its own severity color, the
+// BINDING one adding bold, and an uncounted cell is muted and dim. The
+// countdown follows as its own segment so it can stay muted (and never bold)
+// beside an emphasized binding pct; it is dim only where its whole cell is. A
+// cell with no countdown appends nothing extra — richText.add drops empty text
+// — so a row whose windows carry no resets_at renders exactly as it did before
+// countdowns existed.
+func addCandidateCell(t *pricedText, cell candidateCell) {
 	switch {
 	case cell.win.Binding:
-		t.add(cell.head(), segStyle{Fg: severityColorF(cell.win.Pct), Bold: true})
-		t.addFg(cell.resetSuffix(), colMuted)
+		t.figure(cell.head(), segStyle{Fg: severityColorF(cell.win.Pct), Bold: true})
+		t.countdown(cell.resetSuffix(), segStyle{Fg: colMuted})
 	case cell.win.Counted:
-		t.addFg(cell.win.Label+" ", colMuted)
-		t.addFg(fmt.Sprintf("%.0f%%", cell.win.Pct), colForeground)
-		t.addFg(cell.resetSuffix(), colMuted)
+		t.chrome(cell.win.Label+" ", segStyle{Fg: colMuted})
+		t.figure(pctText(cell.win.Pct), segStyle{Fg: severityColorF(cell.win.Pct)})
+		t.countdown(cell.resetSuffix(), segStyle{Fg: colMuted})
 	default:
-		t.add(cell.head(), segStyle{Fg: colMuted, Dim: true})
-		t.add(cell.resetSuffix(), segStyle{Fg: colMuted, Dim: true})
+		t.figure(cell.head(), segStyle{Fg: colMuted, Dim: true})
+		t.countdown(cell.resetSuffix(), segStyle{Fg: colMuted, Dim: true})
 	}
 }
 
@@ -776,6 +925,36 @@ func truncRich(t richText, width int) richText {
 		break
 	}
 	out.addFg(footerEllipse, colMuted)
+	return out
+}
+
+// clipRichLines is truncRich over a MULTI-LINE richText: every line is fitted to
+// width on its own, and each row break is re-emitted as its own UNSTYLED
+// segment. It is the last-resort width guard for the surfaces that build their
+// own line breaks — the account card, and the monitor's stack of blocks — where
+// truncRich alone would measure the whole block as one line and cut everything
+// after the first break away.
+//
+// The break must stay outside every styled segment: lipgloss left-aligns a
+// styled multi-line segment by padding every line out to the widest, so a break
+// inside one renders its blank first line as trailing spaces on the row above,
+// pushing that row past the terminal (DESIGN A18).
+func clipRichLines(t richText, width int) richText {
+	var out, line richText
+	flush := func() {
+		out.addText(truncRich(line, width))
+		line = richText{}
+	}
+	for _, s := range t.segs {
+		for i, part := range strings.Split(s.Text, "\n") {
+			if i > 0 {
+				flush()
+				out.addPlain("\n")
+			}
+			line.add(part, s.Style)
+		}
+	}
+	flush()
 	return out
 }
 

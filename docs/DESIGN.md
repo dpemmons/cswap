@@ -1098,8 +1098,9 @@ ascending; tier 2 (pct at or above the threshold and below 100 — headroom
 remains, but the candidate is a last resort, mirroring the engine's tier B)
 by pct ascending, i.e. headroom descending; tier 3 (pct at or over 100,
 at/over limit) by renewal ascending with unknown renewal last in the tier,
-then pct ascending; tier 4 the existing sentinel (`bestKey` `998`); tier 5
-the existing usage-unknown case (`999`). Ties at every tier resolve by
+then pct ascending; tier 4 the quarantined case (`bestKey` `997`, A18); tier 5
+the existing sentinel (`bestKey` `998`); tier 6 the existing usage-unknown
+case (`999`). Ties at every tier resolve by
 account number ascending, same as today. Under `best` the panel's ranking is
 untouched.
 
@@ -1218,14 +1219,19 @@ only replaces `max` on a strict `>` and so keeps the first window on a tie.
 
 Emphasis has three levels, applied per window segment (`addCandidateCell`):
 
-- The binding window renders in `severityColorF` of its own `Pct`, bold.
-- A counted, non-binding window renders label in `colMuted`, `Pct` in
-  `colForeground`, no bold: readable, but plain rather than
-  severity-colored. `miniAccountText`'s window cells, by contrast, do
-  severity-color every counted `Pct` (`severityColorF`); a candidate row
-  withholds that color from the non-binding cells on purpose, so a
-  non-binding figure never competes with the binding one for the eye on
-  severity — exactly one cell per row reads as urgent.
+- The binding window renders its whole head — label AND `Pct` together — in
+  `severityColorF` of its own `Pct`, bold.
+- A counted, non-binding window keeps its label in `colMuted` but renders
+  `Pct` in the identical `severityColorF` color the binding window's `Pct`
+  uses, not bold. Severity states what the figure MEANS, and every other
+  surface already colors a counted `Pct` that way — `miniAccountText`'s
+  window cells, the account card's bars (`barCells`/`usageBar`), and
+  `cswap list`'s figures — so a candidate row states it no differently.
+  Bold is the separate fact of which figure the row is ranked by and the
+  engine acts on; only the binding cell carries it. The two facts are not
+  interchangeable, so withholding color from a non-binding `Pct` to make the
+  binding one stand out would conflate them; bold alone already does that
+  job.
 - An uncounted (unmatched scoped) window renders muted (`colMuted`)
   throughout, label and percentage alike, so it reads as informational
   rather than as a figure that could be mistaken for a ranked one.
@@ -1258,17 +1264,720 @@ best"` naming the counted labels in `RelevantWindows` order — `5h, 7d` with
 all models` for the `all` sentinel, since naming every matched scoped
 window individually would defeat the point of the sentinel.
 
-**Width and the never-wrap contract.** Every line the panel emits — the
-`"Next best · counting ..."` header, a readable usage row (`candidateRow`),
-a quarantined/sentinel/usage-unknown row (`candidateLabelRow`, one function
-for all three), and the `"no other switchable accounts"` empty-state line —
-must never wrap regardless of terminal width. `candidatesText` takes the
-same inner width `accountsPanelText` already receives from `view` (`m.width`,
-defaulted the same way, `width <= 0` falling back to 80), and each row shape
-fits its own body to that width before render. The header runs straight
-through `truncRich`; every row below it — a readable usage row, a label row,
-and the empty-state line — runs its fitted body through `truncRich` via the
-shared `candidateRowText`, described below.
+**The shared window table (`internal/tui/table.go`).**
+The auto-switch panel and the dashboard's accounts monitor both lay a
+non-active account's usage windows into one shared column layout, so a
+window reads the same way wherever it appears — when that layout is the
+one drawn; which surfaces draw it and when is a PRICED CHOICE, not an
+assumption, and is its own subject below. A `tableRow` carries an
+explicit `kind` (`windowRowKind` / `spanRowKind`) rather than deriving its
+shape from its fields, because the two shapes are MUTUALLY EXCLUSIVE and
+nothing upstream enforced that on its own: `newWindowRow` builds a WINDOW
+row — `Slot`, a `Label` `richText`, and `Windows []candidateWindow`, the
+same slice `candidateWindows` already builds — and `newSpanRow` builds a
+SPAN row carrying one `Span` message in `SpanFg` instead of window cells:
+the quarantined/sentinel/usage-unknown shape on the panel, the
+sentinel/usage-unknown shape on the monitor. `tableRow.span()` reads the
+`kind` field the constructor set. A SPAN row's own width contract — how
+`tableLine` fits `Span` against the label cell the width ladder has
+already sized — is below, alongside that ladder. `tableOpts` is the two
+surfaces' only remaining difference — the slot cell's indent and color
+(`candidateTableOpts`: 2-column indent, plain foreground, matching
+`candidateNumber`'s margin; `monitorTableOpts`: no indent, bold muted,
+matching `miniAccountText`'s prefix) — plus `headerFloor` and `policy`
+(below).
+
+Every surface also keeps its own PER-ROW fallback: the panel's
+`candidateRow`/`candidateLabelRow`, the monitor's `miniAccountText`. The
+two fallbacks state a window differently — the panel repeats a window's
+label on every row and states every window at every percentage; the
+monitor states only `5h`/`7d` by default and names a reset, or a
+per-model window at all, only once it has run out — and each fallback's
+own contract, described further below, is the RELEASE BAR the table is
+priced against on that surface (`tablePolicy`, `layoutScore`).
+
+`tableColumns` builds the column set in two passes. The first is the union of
+every WINDOW row's window labels, keyed by `(label, occurrence-within-the-row)`
+rather than the label alone, in the order the rows are handed to it — so a
+row's Nth window under a given label lands in the table's own Nth column
+carrying that label, never merged into an earlier one. An account CAN report
+two windows under one display name — two scoped per-model weekly windows
+sharing a name is the practical case — and keying on the label alone would
+collide those two cells into a single column, the later-reported window
+silently overwriting the earlier one there. That earlier window can be the
+row's BINDING one — binding is a property of the WINDOW, not of its label —
+so the collision would leave the row ranked by a figure the table does not
+show at all. One column per reported window is the only assignment that
+cannot lose one; its price is a label repeated in the header exactly when,
+and only when, an account repeats it, which is what the account itself
+reports.
+
+The second pass, `canonicalTableColumns`, reorders that union CANONICALLY and
+rewrites the per-row assignment (`at`) to match, so nothing downstream ever
+sees the raw scan order. The order is TOTAL — `tableColumnRank` (0 for
+`windowLabel5h`, 1 for `windowLabel7d`, 2 for everything else), then the
+label itself, then the occurrence within the row — which makes the header a
+function of the label MULTISET and of nothing else. Ordering by first
+appearance across the rows instead makes it a function of ROW order: a
+7d-only account listed above a 5h+7d one prints `7d 5h`, and two accounts
+reporting different models swap their scoped columns as they re-rank. On the
+panel row order IS the live ranking, so such a header re-reads itself from
+one poll to the next with no resize and no change in what any account
+reports, disagreeing with the account card, the mini account line and `cswap
+list`, all of which read `5h` before `7d` always. Whichever way a row's
+labels land, one guarantee holds regardless of either pass: the cell carrying
+a row's ranking figure is always present on the table, and it is always that
+row's one bold cell — the width ladder below drops only columns nothing has
+PINNED (`pinTableColumns`, below).
+`tableGrid` resolves every row's cells against the per-row column assignment
+`tableColumns` returns (`at [][]int`, one column index per entry of
+`Windows`, in the same order) and derives each cell's countdown once, through
+`tableCountdown` — `candidateCountdown` with the leading `"resets "` word
+trimmed off, so the table reuses `resetText`'s duration grammar rather than
+introducing a second one. `measureColumns` sizes each column's percentage
+sub-width to its widest CELL — never to its header, so a column costs what its
+figures cost and not what its window is called — and its countdown sub-width
+to its widest non-empty countdown (0, and hidden, when no cell in the
+column has one). It also reads off the column what the width ladder judges it
+by: how many ROWS report a figure in it, whether some row BINDS on it, and
+whether some row has RUN OUT in it. `tableLine` writes a cell as the percentage right-aligned
+into the percentage sub-width, then, when the column shows one, the
+countdown left-aligned into the countdown sub-width; a row with no cell for
+a column writes `tableMissing` (`"—"`) in plain `colMuted` there —
+unconditionally, whether or not the column counts and whether or not some
+other row has exhausted it, so a missing figure never borrows either the
+dimming an uncounted, unexhausted figure of its own carries or the color an
+exhausted one would.
+
+Emphasis applies per `tableCell` rather than per row-segment (`cellPctStyle`,
+`cellCountdownStyle`), and it reads three ways too — the same COUNT as the
+panel fallback's contract above, but not the same AXIS. `addCandidateCell`'s
+third branch turns on BINDING: a counted-but-not-binding cell and a binding
+one differ only by bold. `cellPctStyle`'s third branch turns on EXHAUSTION
+instead (below): a counted cell and an exhausted-but-uncounted one differ by
+whether `cell.counted` is read at all. `cellPctStyle` tests `cell.counted`
+first: a
+COUNTED cell is severity-colored, additionally bold when it binds. Failing
+that it tests `cell.exhausted`, the flag `candidateWindows` sets once
+(`Pct >= exhaustedPct`, below) rather than a second `>= 100` comparison of
+its own: an EXHAUSTED cell carries the identical severity color whether or
+not it counts, never bold — bold marks the ranking figure, and an uncounted
+window is never that. Only a cell that is neither counted nor exhausted — an
+uncounted window still short of its limit — stays muted and dim. The third branch exists because of who the accounts monitor's
+columns are: `monitorRow` enumerates every account's windows on the empty
+model axis (`candidateWindows(..., nil)`), so on that surface every
+per-model column is UNCOUNTED BY CONSTRUCTION, and a scoped window at or
+over its limit — the one figure on that row a reader most needs to see —
+would otherwise render no differently from one at 40%. The per-row fallback
+the table replaced never had that gap: `miniAccountText` has always flagged
+an exhausted scoped window outright, as `"Fable (!)"` in the critical color,
+regardless of whether anything counts it; the third branch is what lets the
+table say the same thing a different way rather than saying less. A
+countdown still takes its own cell's level but is never bold, whichever of
+the three percentage branches applies — the countdown is supporting detail
+on every cell, binding included, so it never competes with the percentage
+for the eye (`cellCountdownStyle` reads only `cell.counted`, two levels,
+since a countdown carries no severity of its own to promote out of the muted
+band). `tableLayout.header` renders each surviving column's label muted, and
+additionally `Dim` when `!counted` — the same predicate `cellPctStyle`'s
+first branch reads — so the header and a row's own muting can never
+disagree about which columns count; the header itself carries no third
+branch, since exhaustion is a fact about one row's CELL, not about the
+column as a whole.
+
+**A figure too wide to spell — `displayPctCap`, `pctText`.** A window's
+`Pct` is carried at the value the store reported, never clamped: the
+ranking (`bindingPct`, `oauth.AccountHeadroom`), the severity ramp
+(`severityColorF`), and the exhaustion test (`Exhausted: w.Pct >=
+exhaustedPct` in `candidateWindows`) all read the real number, so nothing
+the table decides from a window's percentage can disagree with a decision
+`bindingPct` already made from the same figure. Only the SPELLING is
+bounded. `pctText` is the ONE function every surface renders a percentage
+through — `table.go`'s `tableGrid`, the panel's `candidateCell.head` /
+`addCandidateCell`, and the monitor's `miniAccountText` — so no two surfaces
+can round or bound one differently: it prints the rounded figure up to
+`displayPctCap` (999) in EITHER direction and, past that, the elision
+marker — `">999%"` above it, `"<-999%"` below — rather than a rewritten
+`"999%"`/`"-999%"`, honest about what the store did not report, in place
+of a figure that would be true of exactly one value and false of every
+other past the cap. Both tails are bounded because both are reachable:
+`oauth`'s projection drops NaN and ±Inf but deliberately keeps a NEGATIVE
+utilization, a measurement worth showing and one a store can report as
+easily as an oversized positive one. Bounding the VALUE instead would have
+sized every column a store-supplied number touches off a single absurd
+measurement, since `minTableWidth` charges a pinned column its widest
+figure; bounding only the rendered text keeps that cost fixed — six
+columns, the width of `"<-999%"`, whatever the number — without touching
+what the account card and `cswap list` — which read the same entry and
+share no column with any other account — still print in full.
+
+**How a header abbreviates — `headerLadders`, injectivity.** A column's
+name is fitted to the sub-cell `measureColumns` already sized from its
+figures (`bodyW`), never the reverse: a name too wide for that sub-cell
+abbreviates, and the sub-cell never widens to make room for a name.
+`headerLadders(cols, floor)` builds the abbreviation ladder once per render,
+from the table's DISTINCT label set alone (`distinctColumnLabels`) — never
+from width — so which spellings exist to choose among is a fact about the
+roster, and only which one is IN FORCE is a width question. `headerLevels`
+returns a sequence of LEVELS, level 0 the identity mapping, each later level
+a map from every distinct label to a shorter spelling, admitted only when it
+is `injectiveLevel` — one-to-one from distinct label to spelling, so no two
+different models are ever spelled alike; an ambiguous heading is terse, a
+colliding one is FALSE, and a table that lies is worse than one that does
+not fit. `windowLabel5h`/`windowLabel7d` sit outside `scoped`
+(`distinctColumnLabels`) and so pass through every level unabbreviated —
+they are two columns already, and the two windows every other surface
+names the same way.
+
+The levels are tried in order, each built from the last one accepted.
+`dropSharedPrefix` strips the longest token prefix (cut at the last `-`/`_`)
+every SCOPED label shares — a no-op with fewer than two distinct scoped
+labels — and `dropDateToken` strips a trailing eight-digit release-date
+token (`-20251101`) from any scoped label that carries one; both also have
+to `clearsFloor` (no label's spelling falls under `floor` columns, unless
+the label's own full width already sits under it, in which case that label
+is spelled whole) or the step is skipped, base unchanged, and the next step
+tried in its place. Both steps are STABLE: each depends on the label set
+only through a prefix or a token shape it shares, so admitting an account
+never reflows a spelling the ladder already settled on for another label.
+Once both are tried, `elideLevel`/`middleElide` takes over: it cuts a
+scoped label's MIDDLE out at `k` columns and keeps both ends — a model
+distinguishes itself by family at the head and by version at the tail,
+where a plain prefix clip keeps only the half every sibling shares. `k`
+descends one column at a time from the current widest label's width down to
+`floor` — the loop's own bound rather than a `clearsFloor` call, since every
+`k` tried is already at least `floor` and `middleElide` only ever cuts a
+label down TO `k`, never past it. The first `k` whose
+elision collides ends the ladder outright (`injectiveLevel` fails → the
+loop breaks rather than skips this step), since an elision that collides at
+`k` collides at every narrower `k` too — the head and tail it keeps are
+only ever cut further, never rearranged. `windowColumn.hdrMin()` is the
+width of the ladder's last, coarsest accepted level, and `floorW()` — the
+term `minTableWidth` charges the column — is `max(pctW, hdrMin)`.
+
+`floor` is `opts.headerFloor`, raised to `headerHardFloor` (2 — the width
+of `"5h"`/`"7d"` and of a percentage, the narrowest anything on the table
+may ever be spelled) when a surface asks for less. The two surfaces ask for
+different floors because their release bars name a window differently: the
+MONITOR (`monitorTableOpts`) takes the ladder's own floor, `headerHardFloor`
+— its own fallback, `miniAccountText`, never names a scoped window at all
+until it has run out, so the ladder is free to spend width on figures
+rather than syllables. The PANEL (`candidateTableOpts`) sets `headerFloor:
+4` — never below a whole syllable — because its own fallback, `candidateRow`,
+always prints a model's name in full, and a header trimmed to two columns
+would name a window worse than the layout it replaces.
+
+Once the ladder is built, which LEVEL is in force is one number shared by
+every column (`setHeaderLevel`), never a per-column choice — the header
+reads at one level of detail, not a mixture. `shrinkTableHeaders` — the
+width ladder's rung (a), and the FIRST rung walked — coarsens that shared
+level by exactly one step per call, while a column is still wider than its
+own figures need, and never past the ladder's last level. It is walked to
+exhaustion before any countdown is shed, so every countdown rung below it
+always measures against one fixed, already-coarsest header level, never one
+still in motion.
+
+**Hard minimums — `pinTableColumns`, `protectedColumn`.** What the table may
+never give up is DECLARED before the ladder walks, not guarded after it.
+`pinTableColumns` marks three kinds of column as PINNED. Every COUNTED one:
+it is the binding column for some row, and the panel's `"counting …"` note
+names it, so dropping it would both hide the figure that row is ranked and
+decided by and make the header disagree with the note above it. Every column
+holding some row's PROTECTED cell — `protectedColumn(cells)` is that row's
+BINDING window, or, for a row with no counted cell at all, its HIGHEST
+figure. That second case is not a corner: the monitor enumerates on the empty
+model axis, so an account whose only windows are per-model ones has nothing
+counted anywhere, and the figure that says whether it can serve anything is
+the largest of them. And every column some row has RUN OUT in, on the surface
+whose own per-row layout states an exhausted window
+(`opts.policy.PinExhausted`). Pinning is then closed over LABEL GROUPS: all
+the columns of one label, or none. Dropping one occurrence of a repeated
+label leaves a row that really does report that model rendering an em dash
+under it — a false statement, and the only one the `(label, occurrence)`
+column key makes structurally possible.
+
+**A table's EXISTENCE is one comparison — `minTableWidth`.** Whether a
+table can be laid out AT ALL, at a given width, is decided before any
+layout, by a closed-form floor:
+
+	slot cell + label floor
+	  + for each PINNED column: the gutter + max(its figures, its coarsest name)
+	  ... or, when a SPAN row asks for more,
+	slot cell + label floor + the gutter + the widest span floor
+
+`slotW` is `opts.indent` + the widest slot number (at least 2) +
+`tableSlotGap`; the label floor is one column for the bare ellipsis, or none
+at all when no row carries a label. `windowColumn.floorW()` is
+`max(pctW, hdrMin)` — the column's own figures, or the width of the LAST rung
+of its abbreviation ladder, whichever needs more. `minTableWidth(rows, opts)`
+is the larger of the two, and `layoutWindowTable` returns `(tableLayout{},
+false)` for any width below it — the same `false` `renderWindowTable` and
+`pickWindowTable` give whenever no table can be built.
+
+Two properties follow, and both are load-bearing. It READS NO CLOCK: every
+countdown is already shed at the floor, so no term of it can move as a reset
+comes due, and a table's EXISTENCE cannot change between two frames at one
+terminal width. And it is MONOTONE in width, so a terminal that grew never
+loses the POSSIBILITY of a table — there is exactly one false→true
+transition over any width range. Below `minTableWidth` this is the whole
+answer: a surface never attempts to build a table, and its per-row layout
+is the render. AT OR ABOVE `minTableWidth`, existence is NECESSARY but no
+longer SUFFICIENT — which layout a surface actually draws is a further,
+PRICED question, below.
+
+**The priced choice — `pickWindowTable`, `layoutScore`, `releaseBar`,
+`fullWidth`.** A union-column table existing is not the same as it being
+the better read, and the reason is structural, not a defect in how far it
+narrows: its columns are the union ACROSS rows, so every row pays the
+gutter and the sub-cell of every OTHER row's windows too — including an em
+dash where it reports no such window — while a per-row layout pays only
+for what its own row has. On a roster whose accounts report different
+scoped models the table can therefore end up stating the same figures
+spread over more columns, and buys the room by shedding countdowns a
+per-row layout still affords. No reordering of the width ladder's rungs
+fixes that; it is the PRICE of column alignment, and it is why the
+existence floor above can only ever be a cheap PRE-CHECK — there is no
+sense pricing a layout whose own floor already rules it out — never the
+whole decision.
+
+`pickWindowTable(rows, width, now, opts, perRow) (windowTable, bool)` is
+the single entry point both `candidatesText` (autoview.go) and
+`monitorLayout` (widgets.go) call on every render. `now` reaches only the
+layout actually DRAWN once the choice is made; the choice itself is priced
+without it (`renderClock`, below). `perRow` is a `perRowPricer` —
+`func(width int) layoutScore` — the caller's OWN closure over its per-row
+layout, able to price it at ANY width, not only the one being rendered:
+both callers build their per-row LINES for the current width
+unconditionally first, spelled live against `now` (those are exactly the
+lines drawn if the table loses), and `perRow` itself prices the identical
+rows at `widestClock()` regardless of which width it is asked about
+(`candidateRowPriced`/`candidateLabelRowPriced` on the panel,
+`miniAccountPriced` on the monitor). `layoutScore{figures, countdowns,
+spanChars, identChars}` is what a render actually DISPLAYS on each axis —
+the reader's three questions: how used is each window (figures), when does
+each free up (countdowns), why can the engine not use this account
+(spanChars) — and `identChars`, deliberately excluded from every
+comparison below (IDENTITY IS NOT AN AXIS, further down). `pricedText` is
+the line builder both the table's `tableLine` and the per-row renderers
+share to produce one: every appended run is either CHROME (`.chrome`) — a
+gutter, a window's label, a separator, priced on no axis — or a DATUM on
+one of the three compared axes (`.figure`, `.countdown`, `.span`/
+`.spanWhole`, plus `.identity`/`.identityWhole`/`.identityRun` for the
+measured-but-unused fourth). `pricedText.fit` clips the line exactly as
+`truncRich` always has and reports only what SURVIVED: a figure or a
+countdown counts only when the WHOLE of it is on the line — half a
+percentage states nothing — while a span message or an identity cell
+counts by the columns of it that made it (`shownContent`), one marker's
+width forfeited to the cut mark where it did not fit whole. `layoutScore.
+plus` sums two rows' scores, so a whole per-row layout is priced the
+identical way one `tableLayout.render` prices a whole table.
+
+SCORING AND DRAWING READ TWO DIFFERENT CLOCKS, and that is what keeps the
+CHOICE itself off the clock (`renderClock`, `data.go`). A countdown's
+spelling narrows as it ticks — "2h 13m" is four columns wider than "9m" —
+so a layout measured against the live clock is a different width on every
+frame; harmless while it only decides how much a layout SHOWS, not
+harmless when it decides WHICH layout a surface draws, since the panel
+would then flip between the table and the per-row layout between frames at
+one unchanged terminal width. A PRICED layout (`widestClock`) spells every
+countdown at `countdownWidest`, the widest `countdownSpelling` can ever
+produce over its whole `float64` domain ("23h 59m") — `countdownSpelling`
+bounds `formatDuration`'s otherwise-unbounded day form at `displayResetCap`
+(ten days), eliding a farther-out reset as `displayResetOver` (`">9d"`)
+rather than spelling it out, so `countdownWidest` is a BOUND rather than an
+assumption about which resets this codebase happens to report — whatever the
+hour — a `layoutScore`, `fullWidth`, and
+therefore the choice between two layouts, are pure functions of the rows,
+the width and the surface. A DRAWN layout (`liveClock`) spells every
+countdown from the render's actual `now`, so the terminal shows the real
+figure and the columns a short countdown frees are spent on real detail.
+The drawn layout is never narrower per countdown than the priced one, so
+it states at least what it was priced at and usually more — the bar it
+cleared is a lower bound, never a promise of exactly that much.
+
+NAIVE SAME-WIDTH DOMINANCE IS NOT MONOTONE, and that is a MEASUREMENT, not
+a hypothesis. `layoutScore.atLeast(other)` — `figures >= `, `countdowns >=
+`, `spanChars >= `, ALL THREE, nothing summed or exchanged, since the axes
+do not convert into one another and no exchange rate between a countdown
+and a column of a reason is defensible — compared at the RENDER width
+alone lets the two layouts go INCOMPARABLE over a band of widths: the
+table ahead on figures, the per-row layout ahead on countdowns, and a
+choice that flips inside such a band takes back on one axis what it gives
+on another as the terminal WIDENS. On the property corpus the naive
+same-width comparison costs three of six figures on a panel exactly ONE
+COLUMN WIDER (29 → 30) — precisely the defect "widening a terminal only
+ever gives detail back" (I8) exists to forbid.
+
+`pickWindowTable` closes that with a CONSTANT reference rather than a
+sharper comparison:
+
+	priced := layoutWindowTable(rows, width, widestClock(), opts)
+	here   := perRow(width)
+	ref    := here
+	if priced.full > width { ref = perRow(priced.full) }
+	draw the table iff priced.score.atLeast(releaseBar(here, ref))
+	(then re-lay the table out at liveClock(now) for what is actually drawn)
+
+`tableLayout.fullWidth()` (`priced.full`) is the width at which the WINDOW
+rows shed no COUNTED data at all — every column present, every countdown
+shown, the identity cell at its full desire; only naming is already at its
+coarsest there, since a header is priced on no axis and rung (a) is spent
+before any of the three that are.
+
+NO SPAN ROW'S MESSAGE LENGTH APPEARS IN `fullWidth`, and that is the
+point: it is the reference the release bar is taken at, so anything
+charged to it is charged to EVERY account on the surface — sizing it by
+the widest whole message would let the LENGTH of one account's reason
+text, not even rendered at the widths in question, decide whether every
+OTHER account gets the table. The message axis is priced at the render
+width instead (below), where both layouts are equally bound by the
+terminal, so a message costs nothing but its own row.
+
+`fullWidth` is measured on the PRICED layout, so it inherits the same
+guarantee: every countdown it sums is `countdownWidest` wherever a column
+shows one at all, never a live remaining time, so a countdown ticking down
+cannot move it. `releaseBar(here, ref)` builds the bar the table's own
+score must clear:
+`ref`'s figures and countdowns — the per-row layout priced at `fullWidth`,
+which by the per-row layout's own width-monotonicity can never be less
+than what it displays at the actual, narrower render width — combined with
+`here`'s span characters, priced at the ACTUAL width, because a span
+message is bound by the terminal in BOTH layouts alike and a wider
+reference would demand of the table what no layout can show in hand
+(`spanIdentW` already guarantees the table's message is never the shorter
+of the two at one width, so this clause is a standing check that it never
+starts to be, not an active one).
+
+A CONSTANT bar is what restores monotonicity. Both layouts are
+individually monotone in the width on their own compared axes (I8), so a
+bar that does not move with the render width makes the set of widths at
+which the table wins UPWARD CLOSED, and an upward-closed choice between
+two monotone layouts is itself monotone on every axis: two widths that
+draw the same layout are trivially monotone with each other; at the single
+boundary where the choice flips from per-row to table, the table displays
+at least the bar, and the bar is the per-row layout's score at `fullWidth
+≥` that boundary, which per-row monotonicity makes at least what the
+per-row layout displayed one column narrower; and "table below, per-row
+above" cannot happen at all — that is what upward closure means.
+
+THE SAME CONSTRUCTION PROVES I13 (below) rather than arguing for it
+separately: at or below `fullWidth` the bar already dominates the per-row
+layout's actual score at that width — `ref = perRow(fullWidth) ≥
+perRow(width)` by the identical per-row monotonicity — so a table that
+clears the bar clears the per-row layout too; at or above `fullWidth`,
+`ref = here` and the table is stating EVERYTHING the rows contain, which
+nothing built from the same rows can ever exceed.
+
+IDENTITY IS NOT AN AXIS. `identChars` — the columns of an account's own
+alias or email a layout renders — is measured by the identical machinery
+and carried on every `layoutScore`, but neither `atLeast` nor `releaseBar`
+reads it (`releaseBar`'s own return value does not even forward it). A
+shared table buys its column alignment out of that very cell (rung (e),
+below), so weighing identity in the same comparison would refuse the table
+at exactly the widths where lining every row's figures up under one
+heading is what it is FOR — and the slot number still names the account
+for `cswap switch`/`cswap use` either way. This is the one respect in
+which the choice does not stay monotone: a surface can show a SHORTER
+email at the width where it just switched into table mode than it showed
+one column narrower, in the per-row layout it left behind. It is measured
+and reported precisely so this can be stated as a documented
+NON-GUARANTEE rather than discovered as a surprise — see I8, below.
+
+**The width ladder — NAMING is the cheapest thing on the row, DATA outranks
+IDENTITY.** `renderWindowTable`'s own comment states the rungs, re-measured
+after every single step so the table gives up only as much as the width
+demands:
+
+	(a) the HEADER TEXT, one abbreviation level at a time, all columns together
+	(b) countdowns of UNCOUNTED columns, rightmost first
+	(c) countdowns of COUNTED non-binding columns, rightmost first
+	(d) the BINDING cell's countdown (opts.policy.KeepBindingCountdown)
+	(e) the label cell, narrowing toward the bare ellipsis
+	(f) the countdown of an EXHAUSTED column (opts.policy.PinExhausted)
+	(g) whole LABEL GROUPS, the group the FEWEST rows report going first
+	(h) a SPAN row's message, cut with the ellipsis marker, never past its floor
+
+(a) is `shrinkTableHeaders`; (b)–(d) and (f) are one function,
+`shedCountdown`, walking the rungs `countdownRung` assigns each column; (g)
+is `dropTableGroup`; (h) is `tableLine`'s span branch cutting against
+`spanBudget`. Below (g) the width is under `minTableWidth` by construction
+and the ladder never arrives there.
+
+NO RUNG'S PLACE IS A MATTER OF TASTE, but (a)'s two neighbors are NOT
+placed for the same kind of reason, and only one of the two reasons is a
+hard requirement. Both orderings of (a) and (e) were measured against the
+monotonicity sweep — header-before-label as built, and label-before-header
+as a deliberate trial — and BOTH came back monotone: nothing about
+monotonicity alone picks between them, so (a) sitting above (e) is a VALUE
+choice, not a forced one. It is the identical INFORMATION-VALUE argument
+that places (a) above the countdowns (b)–(d): a NAME is not a MEASUREMENT,
+and it is not an IDENTITY either. The header names a column whose figures
+are on the screen regardless of how the column is spelled — a reader who
+has lost the spelling can usually still tell one of two or three columns
+from the figures and their fixed canonical order (`5h`, then `7d`, then
+scoped by name) — while the shared label states each row's own identity,
+which nothing else on the row restates once it is gone; a countdown is
+likewise the only cell that says when a window frees up. With a real model
+name ("claude-opus-4-5-20251101") the header term is what makes a column
+dear at every ordinary width, so it is spent first: not because narrowing
+it costs nothing, but because, cell for cell, it buys the least of
+anything else on the row — countdown, label, or column. (e) sits above (g)
+because a WINDOW row's cells are the DATA the row exists to show while the
+label is only its IDENTITY, and the slot number still identifies the row
+once the label is a bare ellipsis. (e) is a single clamp rather than a
+re-measuring loop, so a table with far too little room falls through with
+the label already pinned at its floor. (f) sits BELOW (e) because an
+exhausted window's reset is the one countdown the per-row layout states
+unconditionally — worth more than every account's email, and nothing else
+buys it. Rungs (a)–(d), (f) and (g) read `cols` alone, so they answer a
+WINDOW row's overflow and only a WINDOW row's: no countdown a SPAN row does
+not carry can buy that row's message a column.
+
+Each rung is walked to EXHAUSTION before the next begins, which is what
+keeps this order monotone as well as forced. (a) stops early only by
+FITTING, so a countdown is shed only at a width where the headers are
+already spelled at their coarsest — the surviving countdown set at any width
+is then a function of that width and one fixed level, never of a level still
+in motion. Likewise the label narrows only once (a)–(d) are spent, so
+`labelW = clamp(width − K, floor, labelWant)` against a CONSTANT K, and a
+column drops only once the label is at its floor. Each quantity the reader
+sees is therefore monotone in the width on its own (I8).
+
+**Per-surface policy — `tablePolicy`.** Two of those rungs cannot read the
+same way on both surfaces, because the table's release bar is each surface's
+OWN per-row fallback and the two fallbacks say different things.
+`PinExhausted` is true on the MONITOR, where `miniAccountText` states every
+exhausted window unconditionally (`"Fable (!)"`, `"5h 100% (resets 12m)"`),
+and false on the PANEL, where `candidateRow` DISCARDS an exhausted uncounted
+figure at every width — pinning one there would trade the panel's whole table
+away to protect a figure the layout it replaces then throws away.
+`KeepBindingCountdown` is true on the PANEL, mirroring `candidateShedSteps`'
+final rung, and false on the MONITOR, whose fallback has no such rung.
+
+A SPAN row answers to (e) too, but the reason is a different one — not DATA
+outranking IDENTITY within the row, but one row's DATA never outranking
+every OTHER row's IDENTITY. The label column is SHARED: every row renders
+into the same `labelW`, so a message measured at its own full width would
+buy itself columns out of every other account's email — the 82-column
+re-login sentinel note, sized that way, would narrow every healthy row's
+identity to make room for one unhealthy row's reason. So `tableWidth` weighs
+a SPAN row's demand on (e) at `spanFloorWidth` — the stub its message is
+GUARANTEED — never at the message's own width, and (e)'s clamp fires on a
+span row's behalf only once the terminal cannot hold even that stub.
+Above that point the message alone narrows, for free, as `spanBudget`
+shrinks with the terminal while `labelW` sits untouched; only once the
+message is already pinned at `spanFloor` and the terminal is still too
+narrow does (e) begin narrowing the shared label — toward ITS OWN floor, the
+bare ellipsis — on the message's behalf. The visible order on a SPAN row is
+therefore the message first, down to its own floor, and the shared label
+second, down to its own — the reverse of a WINDOW row's label-before-columns
+order, because what rung (e) protects there is not this row's own data but
+every OTHER row's identity.
+
+**Which column goes — `dropTableGroup`.** A pinned column is on no rung at
+all, and pinning is closed over label groups, so every group rung (g) can
+reach is droppable whole. Among those, the victim is the group the FEWEST
+ROWS report a figure in, ties going to the rightmost in canonical order.
+Rightmost-first alone made the table rob the many to spare the one: a model
+three accounts reported went before a model one stranger reported, purely
+because the stranger's column sorted later. ISOLATION IS UNATTAINABLE for a
+shared column — it is bought for everyone or for no one — so which column
+goes is the only fairness question a table can actually answer, and the
+count is of ACCOUNTS, not of cells: a row reporting two windows of one model
+is one account either way.
+
+**The header says when a column went — `tableElision`.** A row's em dash
+means "this account reports no such window"; without a marker there would be
+nothing anywhere to say that a window it DOES report is not on the grid at
+all. So a table that dropped columns ends its header with a muted, dim
+`"+N"` — at most two columns, charged to the header line only and printed
+only where it fits. Past what two columns can spell it reads `"+9"`, which is
+all a marker this size can honestly say.
+
+**The post-conditions — `sound`.** `windowRowsWidth() <= width`, `spansFit()`
+and `rowsKeepAFigure()` are checked after the ladder settles, as
+POST-CONDITIONS rather than gates: at or above `minTableWidth` the
+fully-shed table fits, every span row clears its floor, and every window
+row keeps its protected cell, so none of the three is ever false. `sound`
+states them as a hard assertion — a `false` return, the same total flip —
+so that a change to the pinned sets that makes one of them reachable shows
+up as a surface that flips rather than as a table that lies. The property
+suite asserts
+`ok == (width >= minTableWidth(rows, opts))` over the whole corpus, which is
+the proof they never fire; a mutation removing the per-row protected column
+makes `rowsKeepAFigure` fire and that assertion catch it.
+
+Label narrowing (e) sits entirely inside the table's own layout machinery
+(`layoutWindowTable`, shared by `renderWindowTable`, `priceWindowTable` and
+`pickWindowTable`) — neither `candidatesText` nor `monitorLayout` ever sees
+a label width or takes any part in narrowing it; each receives only the
+finished `windowTable` and the `bool` outcome `pickWindowTable` gives them.
+
+**A SPAN row's floor — `spanFloor`, `spanTokenFloor`, `spanMin`,
+`measureSpans`, `spanFloorWidth`, `spansFit`.** A SPAN row (`tableRow.span()`)
+has one cell of content, its whole `Span` message, and the table's layout
+machinery protects a minimum of it the way `PinExhausted` protects an
+exhausted WINDOW column. `spanFloor` treats two kinds of message
+differently. A SENTENCE — a classification word and then the detail —
+keeps its whole first word plus `footerEllipse`'s width, or the whole
+message when that is shorter: the message's classifying first word —
+"quarantined", "re-login", "usage" — is the reason the row is on the table
+at all, and a cut landing inside it ("quarantin…") would state nothing a
+reader could act on, so the floor never falls inside that word. A single
+TOKEN — a message with no space at all, which is what `sentinelLabel`
+prints for a sentinel state absent from `sentinelNotes`, the usage store's
+own diagnostic identifier verbatim — has no classification word to keep, so
+`spanFloor` may cut it down to `spanTokenFloor` (12 columns, the width the
+widest PHRASED first word in this codebase already demands, "quarantined
+…"): a prefix of a diagnostic identifier identifies it as well as anything
+short of the whole does, and bounding it here keeps the width this
+package's own choice rather than one a store-supplied string makes on its
+behalf — the alternative, rewording the raw state behind a word of this
+package's own, was rejected because it would change what `cswap list`, the
+account card and the watch and switch screens print to answer a question
+only the narrow table asks.
+
+`measureSpans` walks every SPAN row once and returns `tableSpans{any,
+floor}`: whether the table carries any SPAN row, and the widest FLOOR among
+them — the ladder reasons about a table's SPAN rows as one combined demand,
+not per row. The LADDER asks only for the floor: a span message is fitted
+to whatever the row has left (rung (e)), and the only width it may ever
+demand OF THE SHARED LABEL CELL there is its floor; the full message plays
+no part in sizing any cell, and no part in the PRICING either (`fullWidth`,
+below) — a span row's length is answered where it is rendered, never where
+the reference width is located. `measureSpans` takes each floor through
+`spanMin`, which bounds it by `spanHardCap` (24). That cap is a documented
+backstop and nothing else: every message this codebase can produce, a
+sentence or a token, has a floor at or under `spanTokenFloor`, well inside
+the cap, and a standing test proves so. A floor that reached the cap would
+be a DATA bug — a store-supplied string setting every account's identity
+width — and `spanTokenFloor` is what rules it out without rewording what
+the store wrote.
+
+`tableWidth` reads BOTH row shapes and returns the wider:
+`windowRowsWidth()`, and `spanFloorWidth()` — the slot and label cells, then,
+behind one `tableGutter`, `sp.floor`, never a SPAN row's message at full
+width. Rung (e)'s single clamp reads this combined width, so it narrows
+`labelW` on a SPAN row's behalf only down to the point that guarantees the
+floor, never further — past that point the row's own message absorbs the
+narrowing instead (above). `spansFit(width)` is vacuously true when the table
+carries no SPAN row (`!sp.any`), else whether `spanBudget(width, slotW,
+labelW)` (`width` less `slotW`, `labelW` and one `tableGutter`) reaches at
+least `sp.floor`; `spanBudget` already falls below any non-negative floor once
+the identity cells alone overflow `width`, so one comparison covers both a
+too-narrow label and a message too long for what is left of it. It is a
+POST-CONDITION, not a gate: `minTableWidth` already charges the widest span
+floor, so wherever the table renders it is satisfied by construction. This is
+the LADDER's use of `spanBudget` — deciding how far the SHARED `labelW` may
+narrow — and it is the only place `spanBudget` is ever called against that
+shared width.
+
+`tableLine`'s span branch calls `spanBudget` a second way, and this is where
+the DRAWN message states more than the ladder's guarantee requires. The
+message is drawn starting right after THIS row's OWN label — `clipText(r.Span,
+spanBudget(width, slotW, rtWidth(label)))` in `r.SpanFg`, where `label` is
+the row's own (already-clipped) label, not the padded-out shared column — so
+it has nothing to align with and pays nothing for a wider label two rows
+down. A row lays no figure into any column, so charging it for the table's
+widest label would make it state LESS than the per-row layout it replaces
+(`candidateLabelRow` / `miniAccountText` each give the message the whole
+rest of their own line); never-less-than-the-fallback outranks column
+alignment, so two SPAN rows may begin their messages at different columns
+from one another when their own labels differ in width. `spansFit`'s
+guarantee is what makes this safe without `tableLine` re-checking the floor
+itself: a row's own label is never wider than the shared `labelW` the ladder
+measured, so the shared floor is a LOWER bound on every row's real budget,
+and a row whose own label is narrower than the widest simply gets more room
+than the ladder promised, never less. `spanBudget`'s baseline here is NOT the
+shared `slotW+labelW+tableGutter` offset `windowRowsWidth` measures its first
+column from — it is `slotW` plus THIS row's own label — so a SPAN row's
+message begins at the same column a WINDOW row's first cell would only on a
+roster where the row's own label happens to be the table's widest
+(`TestWindowTableSpanStartsAfterItsOwnLabel`); on any other roster a
+shorter-labelled SPAN row's message begins earlier and states more of its
+reason than the shared floor alone guarantees, a direct consequence of the
+lower-bound relationship above, never a violation of it. The message shrinks
+well before `labelW` does: since rung (e) leaves the SHARED `labelW`
+untouched across the whole band of widths wide enough for the floor alone, a
+SPAN row's message clips steadily as the terminal narrows while every OTHER
+row's email stays full, and only once the message is pinned at its own
+`spanFloor` does the shared label begin to give ground, toward its own
+floor in turn (`TestWindowTableSpanPrecedence`). A message that already
+fits its budget renders whole, with no ellipsis at all; a message the row
+must cut carries `r.SpanFg` — its own color — on the trailing ellipsis,
+never `truncRich`'s `colMuted` marker (`TestWindowTableSpanRowFitsWidth`).
+
+**Total-flip fallback.** The choice is still not a per-row signal —
+`pickWindowTable` is called once per surface, over every row that surface
+would show, and its one `bool` verdict (existence AND `score.atLeast
+(releaseBar(here, ref))`, above) covers the whole set. Both call sites
+treat it as total: `candidatesText` builds every `ordered
+[]candidateEntry` through `candidateEntry.rowPriced` FIRST,
+unconditionally — summing the results into `here`, the score of the lines
+it draws if the table loses — then wraps `here` (and a re-render at any
+other width `pickWindowTable` asks for) in a `perRowPricer` closure and
+hands the whole row set to `pickWindowTable`, drawing the table's `Header`
+(when it has any segments — `len(table.Header.segs) > 0`; a table of
+nothing but SPAN rows has no columns and so no header, per
+`tableColumns`) and every `table.Lines` entry when it wins, or walking the
+already-built per-row lines — `candidateLabelRowPriced`/
+`candidateRowPriced` under their unpriced aliases `candidateLabelRow`/
+`candidateRow` — when it does not; `monitorLayout` (below) does the
+analogous thing over `miniAccountPriced`. There is no width at which one
+row renders through the table while its neighbor renders through the
+per-row shape: the same verdict decides every row's layout for that
+render. The point below which no table is even attempted is
+`minTableWidth(rows, opts)` (above), so IT moves with the row set — more
+PINNED columns, longer labels, a longer reason, or a wider slot number all
+push it out — but it is a FLOOR on where the table can start winning, not
+the width at which it does: at or above it, the actual point where the
+table first clears `releaseBar` depends on how the per-row layout's own
+score grows with width too, and can sit anywhere from `minTableWidth`
+upward, though never later than `fullWidth` (above `fullWidth` the table
+states everything the rows contain and nothing beats that). It can differ
+between the panel and the monitor for the identical snapshot for the same
+reason it always could — the two surfaces' own row sets, PINNED columns
+and labels differ even when the underlying accounts are the same — and
+additionally because their two release-bar layouts (`candidateRow` vs
+`miniAccountText`) price differently against the identical table. Both
+surfaces measure against their content budget IN FULL: `monitorLayout`
+treats its `width` parameter as the monitor's whole content budget — the same
+terminal width `dashboard.go` hands every other block, with no internal
+margin subtracted — exactly as the panel measures against its own full inner
+width. Neither surface reserves a margin for a frame that does not exist:
+nothing draws a border or margin around either block's lines, and the render
+path (`clipRichLines`) already holds every block to the width it is given,
+so a reserved margin buys nothing but costs real columns per line and,
+through the flip, whole columns of the table.
+
+**The per-row fallback layout.** This is what a surface renders whenever
+the priced choice (above) does not draw the table — whether because no
+table exists at this width at all (`pickWindowTable`'s `bool` is `false`
+before it ever reaches the pricing) or because one exists but does not
+clear `releaseBar` — and it is ALSO what the panel builds unconditionally,
+on every render, to have a `perRowPricer` to hand `pickWindowTable` in the
+first place: the layout itself, and its own width discipline, are
+independent of the table, and every row reports what it displays as it
+builds (`candidateRowPriced`/`candidateLabelRowPriced`; `candidateRow`/
+`candidateLabelRow` are thin wrappers that discard the score for a caller
+that only wants the line). Every line the panel emits in this mode — the
+`"Next best · counting ..."` header (rendered whether or not a table was
+even priced; it carries no window cells to shed either way and no axis to
+price), a readable usage row (`candidateRow`/`candidateRowPriced`), a
+quarantined/sentinel/usage-unknown row (`candidateLabelRow`/
+`candidateLabelRowPriced`, one function for all three), and the
+`"no other switchable accounts"` empty-state line — must never wrap
+regardless of terminal width. `candidatesText` takes the same inner width
+`accountsPanelText` already receives from `view` (`m.width`, defaulted the
+same way, `width <= 0` falling back to 80), and each row shape fits its own
+body to that width before render. The header runs straight through
+`truncRich`; every row below it — a readable usage row, a label row, and
+the empty-state line — runs its fitted body through `truncRich` via the
+shared `candidateRowText` (or its priced sibling `pricedRowText`, below).
+The table's own `Header` and `Lines` route through the identical
+`candidateRowText` when the table WINS the price comparison, so both
+layouts share the one row-break mechanism regardless of which one a given
+render uses.
 
 The ellipsis falls in a different place for each row shape:
 
@@ -1298,8 +2007,13 @@ as a whole line via the shared `truncRich` guard rather than wrap,
 consistent with `view`'s pinned-chrome layout, where no panel line is
 allowed to push the scrollable event log around.
 
-**Why every row below the header routes through `candidateRowText`.** Each
-of those rows' fitted body picks up its leading row break there, and the
+**Why every row below the header routes through `candidateRowText`.**
+`pricedRowText` gives a `pricedText` body the identical row break and fit
+and additionally reports the `layoutScore` that fit left standing —
+`candidateLabelRowPriced` builds on it directly; `candidateRowPriced` fits
+its own body through `pricedText.fit` first (so the row's OWN shed ladder
+runs before the row break is prepended) and then wraps the result the same
+way. Each of those rows' fitted body picks up its leading row break there, and the
 break is appended as its OWN unstyled segment ahead of the styled body
 rather than folded into the body's first colored segment (the header needs
 no such break — it opens the panel). `richText.render` styles each segment
@@ -1312,6 +2026,378 @@ own width could still push the row ABOVE it past the terminal width and
 wrap. Routing every such row through one function that keeps the break
 unstyled is what makes the never-wrap contract hold across the whole
 rendered panel at once, not merely line-by-line in isolation.
+
+**The dashboard accounts monitor (`internal/tui/widgets.go`).**
+`accountsPanelText` and `accountsMonitorCapped` both draw their content from
+`monitorLayout(snap, width, showMinis, threshold, now, allowTable)`, the one
+place every caller builds a monitor's blocks. `accountsPanelText` is
+`monitorPanelText(..., allowTable: true)`, the unbudgeted caller that
+always wants the table when it fits. `accountsMonitorCapped`, the budgeted
+caller, reaches `monitorLayout` through `fitMonitor` and `cappedMonitor`
+(below) with `allowTable` either way, so it alone can ask for the table's
+column layout to be skipped even where it would otherwise fit.
+`monitorRow(acc reporting.AccountSnapshot) tableRow` projects one non-active
+account: `Slot` and `Label` (`miniLabelCell` — the alias form, `[tag]`, and
+the `(disabled)` marker in the warning color — shared with `miniAccountText`
+byte-for-byte, not just in effect), `Windows` from
+`candidateWindows(acc.Usage.LastGood, nil)` — the `nil` model list is
+deliberate: the monitor's counted axis is always the bare `5h`/`7d` pair,
+never `autoswitch.model`, and passing `nil` reproduces that axis through the
+same projection the panel uses for its own configured one, rather than a
+second axis implementation — or, for a sentinel or a slot with no windows at
+all, a SPAN row carrying `sentinelLabel` / `"usage unknown"`. It takes no
+clock, and neither does the panel's projection: a row carries the raw
+`ResetsAt`, and the hour enters only where a layout SPELLS a countdown
+(`renderClock`) — which is what lets the same rows be priced off the clock
+and drawn against it. Whenever `showMinis`, `monitorLayout`
+builds `miniAccountPriced` for every non-active account first, summing the
+result into `here`: this is both what the monitor draws when the table
+loses (or is disallowed) and the score its `perRowPricer` closure returns
+when asked to price the render width, so it is built whether or not a
+table is even attempted, eagerly rather than lazily, since it is itself
+half of the bar the table is priced against.
+Only when `allowTable` too does `monitorLayout` additionally collect this
+row set into `monitorRow`s and hand both it and the `perRowPricer` closure
+to `pickWindowTable` ONCE per render; `tabled` is set — and the table
+drawn — only when that call reports `true` (a table exists AND its score
+clears `releaseBar(here, ref)`, `ref` being the SAME closure re-run at the
+table's own `fullWidth` when that is wider than the render — above;
+`monitorTableOpts`'s `PinExhausted: true` policy is most of why this
+comparison is close to a formality on this surface: see I13, below). So
+the column layout, when it is used at all, is one priced decision for the
+whole monitor, not one per visible fragment of it; only the TABLE's own
+build is skipped when `allowTable` is false, which is the height cap's own
+saving (below) — the per-row layout is needed there regardless, since it
+is what the height cap's own `allowTable=false` pass renders.
+
+`monitorLayout` returns `[][]richText`, one GROUP per account, so its
+caller can admit or drop a whole account atomically: the active account is
+a group of one (`accountCardText`, its own full card); a non-active account
+is a group of one `miniAccountText` line when the table does not fit or is
+disallowed (`!tabled`), or, when it fits and is allowed, a group of one
+table line — except the first such group in snapshot order, which is two:
+the table's `Header` prepended ahead of that account's own line.
+`monitorPanelText` flattens `monitorLayout`'s groups back into the flat
+sequence `joinBlocks` already knows how to breathe (a blank line around a
+multi-line block, a single line between two one-liners); `cappedMonitor`
+instead walks `monitorLayout`'s groups directly so its height cap admits or
+rejects a header together with the row under it, never one without the
+other — which is what makes both halves of that contract true at once: the
+monitor never shows a header row with nothing under it, and never drops the
+header while rows below it remain. A pathological one-line budget can
+still trim that first group's own two lines down to just the header once
+it has been flattened and re-split; `cappedMonitor` special-cases exactly
+that (`len(lines) == 1 && lines[0] == header`) and substitutes the row the
+header was standing in front of, so even a one-line monitor shows an
+account, never a bare column heading.
+
+**The height cap is a SECOND, independent price, layered on top of the
+first.** `layoutScore.atLeast` (above) has already decided, inside
+`monitorLayout` itself, whether a render wants the table at its full
+content width; `accountsMonitorCapped` prices the outcome of THAT decision
+again, under a fixed LINE budget, and can still veto it. The axis differs
+too: `layoutScore` counts figures/countdowns/span characters at unlimited
+height, `monitorFit` counts ACCOUNTS at a limited one. The table's column
+header spends a line the monitor's per-row shape does not, and at a tight
+budget a line is an account, so `accountsMonitorCapped` does not treat the
+header as a fixed cost to route around — it prices the SAME budget in both
+layouts and keeps whichever shows more. `monitorFit{lines []string, shown int, indicated bool}` is what
+one budget buys in one layout: the lines to print, how many accounts are on
+them, and whether the muted "· N more accounts" note survives (`indicated`,
+vacuously `true` when nothing is elided). `monitorFit.beats(other)` is
+`f.shown > other.shown` when the counts differ, else `f.indicated &&
+!other.indicated` — a tie on both shown AND indicated favors `other`, so a
+genuine tie keeps whichever layout the caller priced first rather than
+switching for no gain.
+
+`fitMonitor(snap, width, threshold, now, budget, allowTable)` renders
+`monitorPanelText(snap, width, true, threshold, now, allowTable)` whole
+first: a monitor that already fits within `budget` is never capped at all
+(`shown == monitorAccounts(snap)`, `indicated` trivially `true`), which is
+where the header's line can cost an account, since the per-row layout of
+the identical monitor is one line shorter. Only when it does not fit does
+`fitMonitor` call `cappedMonitor(snap, width, threshold, now, budget,
+allowTable) monitorFit`: it walks `monitorLayout`'s groups, admitting whole
+accounts (the header riding with the first TABLE row's group, above) until
+the next one would push the joined block past `budget-1`, reserving that
+line for the note, and rescues a budget that clips the always-shown first
+account down to a bare header (`len(lines) == 1 && lines[0] == header`) by
+substituting that account's own row. Its `monitorFit{lines, shown,
+indicated}` return lets a caller comparing two attempts read off accounts
+shown, not just whether the note survived.
+
+`accountsMonitorCapped` runs `fitMonitor` in BOTH layouts at the same
+budget, unconditionally — the table layout (`allowTable=true`) as `tabled`,
+the per-row layout (`allowTable=false`) as `perRow` — and returns
+`perRow.lines` exactly when `perRow.beats(tabled)`: strictly more accounts
+fit without the header's line, or the same count of accounts with the note
+surviving where the table's own attempt lost it to the header's cost.
+There is no shortcut for a monitor that already fits whole: `fitMonitor`'s
+own early return already gives `tabled` and `perRow` the same maximal
+`shown` and `indicated: true` in that case, so `beats` naturally prefers
+`tabled` (a tie keeps the first-priced layout) without a caller needing to
+special-case it. Every other outcome keeps `tabled`, header and all —
+including a budget too tight for either layout to keep the note where both
+also show the same number of accounts, which is where the table's own
+lone-header rescue (above) is what a one-line monitor ends up showing.
+
+Because `monitorLayout` walks `snap.Accounts` in its existing (roster)
+order and only ever substitutes CONTENT, never POSITION, the active
+account's card renders wherever the active account sits in that order — the
+table can end up visually split across the card when the active account is
+not first, its two halves sharing column widths from the one
+`pickWindowTable` call that built them together. The split is a property
+of `monitorLayout`'s ordering; the table only makes the shared column
+alignment across the split visible.
+
+The monitor's own fallback, reached whenever `pickWindowTable` reports
+`false` for the whole non-active set — no table exists, or one exists but
+does not clear `releaseBar` against the minis — is `miniAccountText` — the
+`5h`/`7d`-only, reset-shown-only-at-100%, scoped-window-shown-only-at-100%
+shape spec 09§5.5 describes, narrower than the panel's own fallback
+(`candidateRow`, which states every window and its live countdown at any
+percentage). A terminal too narrow for the shared table loses the wide
+view on this surface; it does not gain one it never had.
+
+`miniAccountPriced(acc, width, clk renderClock)` (and its unpriced wrapper
+`miniAccountText`, which fixes `clk` to `liveClock(now)`) takes a WIDTH and
+fits its finished line through `pricedText.fit`/`truncRich`, so the per-row
+layout `pickWindowTable` prices — at the render width, and again at
+`fullWidth` through the same `perRowPricer` closure — holds itself to the
+terminal at every width either comparison is made. `clk` is the same
+DRAWING/PRICING split every layout on this surface makes (`renderClock`,
+above): the line `monitorLayout` draws spells its countdowns live
+(`liveClock(now)`), while the score it hands `pickWindowTable` as the
+release bar spells them at `widestClock()`, so the bar this surface holds
+the table to reads no clock.
+Its windows come from `candidateWindows(acc.Usage.LastGood, nil)` —
+the one projection every surface reads — rather than the stored map
+directly, so a window `oauth`'s numeric guard drops (`pctFloat` rejects only
+NaN and ±Inf, a window with neither compares against nothing and gates
+nothing; a NEGATIVE measurement is not dropped — it compares fine, is not a
+width hazard, and is a figure `cswap list --json` has always reported, so
+the projection passes it through unchanged) never renders on the fallback as
+a figure the table correctly omits: the two surfaces agree about which
+windows an account has.
+
+`monitorLayout` fits every block it returns through `clipRichLines(t, width)`
+— `truncRich` applied per LINE, since the account card and the joined monitor
+build their own row breaks and a single-line truncation would cut everything
+after the first one away. That is the same last-resort guard
+`candidateRowText` gives the panel's rows, and it is what holds
+`accountCardText`, whose bar rows are laid out from their content rather than
+bounded by the width they are handed, to the terminal. `monitorLayout` does
+not build a table when the caller disallows one (`allowTable=false`, which
+the height cap asks for on every frame) — a saving, since the height cap
+prices the same monitor in both layouts on every render.
+
+### What the shared table guarantees, and what it cannot
+
+The layout is held to seventeen properties, each stated as a predicate over
+(roster, surface, width, `now`) and swept deterministically over a corpus of
+78 rosters × both surfaces × widths 1..160, plus four large rosters at a
+reduced width set (`internal/tui/table_props_test.go`, generator in
+`internal/tui/rosterspec_test.go`). Measurement is on the RENDERED lines with
+ANSI stripped, never on `plain()`: `richText.render` styles each segment on
+its own and lipgloss pads the empty first line of a styled segment carrying a
+newline, so `plain()` cannot see the columns the terminal receives. Emphasis
+is the one exception and is compared by struct equality on `seg.Style`.
+
+- **I1 never-wrap.** No rendered line of the table exceeds its width or
+  carries a `"\n"`, at any width ≥ 1 — asserted on the renderer's own output,
+  never through `candidatesText`, whose `truncRich` backstop would mask an
+  overflow the monitor emits raw. Separately end-to-end, including BELOW the
+  flip and including the active account card.
+- **I2 EXISTENCE AND THE CHOICE ARE BOTH PURE, TIME-INDEPENDENT FUNCTIONS OF
+  (ROWS, WIDTH, OPTS); ONLY THE DRAWN TEXT READS `now`.** `renderWindowTable`'s
+  `ok` (`priceWindowTable`'s degenerate case) is exactly `width >=
+  minTableWidth(rows, opts)`: the floor does not read `now`; `ok` is
+  unchanged as `now` sweeps 14 days at fixed width; exactly one false→true
+  transition over widths 1..300; `renderWindowTable(nil, …)` is
+  `(windowTable{}, true)`. WHICH layout a surface actually draws is
+  `pickWindowTable`'s separate verdict — existence AND
+  `score.atLeast(releaseBar(here, ref))` — and comparing the two layouts at
+  the render width alone is measurably NOT monotone in WIDTH either
+  (`releaseBar`'s own doc comment: three of six figures lost on a panel one
+  column WIDER, 29 → 30, under that comparison); `releaseBar`'s constant
+  reference — the per-row layout's score at `fullWidth` rather than at the
+  render width — is what restores single-transition, the set of widths at
+  which the table wins being proven UPWARD CLOSED (`releaseBar`'s
+  three-case argument, above). The SAME verdict is ALSO single-transition
+  in `now` at fixed width, and this is a separate, explicit result rather
+  than a corollary: `score`, `here` and `ref` are every one of them priced
+  at `widestClock()`, which spells a countdown at `countdownWidest`
+  wherever a column shows one at all rather than at its live remaining
+  time, so the boundary width itself is a pure function of the rows, the
+  width ladder and the surface (`renderClock`, `data.go`). Swept a
+  fortnight at six-hour steps, every roster's boundary is the identical
+  width at every clock reading — drift zero, not merely drift bounded
+  (`TestChoiceIsClockFree`); scoring the two layouts on the text they would
+  actually DRAW instead of at `widestClock` makes a boundary travel up to
+  19 columns over the same fortnight, parking a terminal inside the
+  travelled band in a layout that flips, and loses figures, with no
+  resize. The layout actually DRAWN once the choice is made still reads
+  `now` live, as it must to show the real countdown, but this cannot move
+  the choice: a live spelling is never wider than the `countdownWidest` it
+  was priced at (`TestCountdownsAreNeverWiderThanTheyArePriced`), so the
+  drawn table states at least what cleared the bar and often more
+  (`TestTheDrawnTableStatesAtLeastWhatItWasPricedAt`) — the bar is a lower
+  bound on the terminal, never a promise of exactly that much.
+- **I3 binding survival.** Every WINDOW row renders its BINDING cell's exact
+  percentage, in exactly one bold segment, at every width. A row with no
+  counted cell renders its highest-valued cell instead.
+- **I4 no row renders as only em dashes.**
+- **I5 a counted column is never dropped**, so the header and the panel's
+  `"counting …"` note always agree.
+- **I6 exhausted visibility, PER SURFACE** — see below.
+- **I7 every span row states its reason**, its first word whole; and every
+  message the codebase can produce has `spanFloor ≤ spanHardCap`, so the cap
+  is provably a no-op.
+- **I8 monotonicity**, four flavours over adjacent widths. Three are DATA
+  axes and hold UNCONDITIONALLY, across any width including one at which the
+  priced choice flips between layouts: FIGURES (the (row, column identity,
+  percentage) set at W is a subset of that at W+1), NAMING (no column's
+  header gets finer as the terminal narrows), SPAN (no message grows as the
+  terminal narrows) — these are exactly `layoutScore`'s three compared axes,
+  and `atLeast` never draws a table that regresses on one of them relative to
+  the layout it replaces. IDENTITY (each row's label at W is a prefix of its
+  label at W+1) holds WITHIN one continuously-drawn layout exactly as before,
+  but is a DOCUMENTED NON-GUARANTEE at a width where the choice ITSELF flips
+  between the table and a per-row layout: `identChars` is measured on every
+  `layoutScore` but `atLeast` never reads it (above), precisely so the table
+  is never refused at the width it earns its columns — a surface may
+  therefore show a SHORTER label at the width where it switches into table
+  mode than it showed one column narrower.
+- **I9 scoped isolation, in the only form achievable.** With the column set,
+  every column width, the abbreviation level and `labelW` held fixed, each
+  rendered row is a function of that row's own data alone: move one
+  percentage by one point and every other row and the header are
+  BYTE-IDENTICAL at every width.
+- **I10 drop fairness.** A column is dropped only when no row's protected set
+  holds it, and among droppable LABEL GROUPS the victim is one the fewest
+  rows report.
+- **I11 column identity and order.** Permuting the rows leaves the header
+  byte-identical; two same-labelled windows on one row occupy two columns and
+  both figures render.
+- **I12 attribution.** A percentage under a column is exactly that row's
+  window at (label, occurrence); an em dash means the row reports no such
+  window; a label group is present in full or absent in full; abbreviated
+  headers are injective over the table's distinct labels.
+- **I13 never less than the per-row layout — unconditional, no surface
+  exception.** `pickWindowTable`'s `score.atLeast(releaseBar(here, ref))`
+  is the drawing condition, not a post-hoc measurement of one: on BOTH
+  surfaces the table renders only where its `figures` and `countdowns` are
+  each no fewer than the per-row layout's at `fullWidth` (which per-row
+  monotonicity makes no fewer than at the render width itself) and its
+  `spanChars` no fewer than the per-row layout's AT THE RENDER WIDTH — see
+  below for what this replaced, and for what identity, the one axis
+  excluded from the comparison, does not inherit from it.
+- **I14 the newline boundary.** `table.go` emits no `"\n"`; `Span` and every
+  `Label` segment are normalised newline-free at row construction.
+- **I15 no over-reserve.** `minTableWidth` for each corpus roster matches a
+  recorded baseline exactly (`tableFirstFitBaseline`, `table_props_test.go`)
+  and never exceeds the width recorded there.
+- **I16 emphasis is width-independent.** The six style rules hold at every
+  width; clipping never changes a surviving segment's style.
+- **I17 height-cap baseline.** Over widths {24, 40, 60, 80, 120} × budgets
+  1..14, the accounts shown and whether the "· N more accounts" indicator
+  survives match a recorded baseline (`monitorCapBaseline`,
+  `table_props_test.go`) exactly.
+
+**I6 remains PER SURFACE — a statement about what one CHOSEN table's own
+ladder pins, orthogonal to I13's fix below.** On the MONITOR it holds
+unconditionally, and structurally: `miniAccountText` names `5h`, `7d` and a
+scoped window only once it has run out, and every one of those columns is
+PINNED there (`monitorTableOpts.policy.PinExhausted`), so a table drawn on
+this surface always states them. On the PANEL the guarantee is explicitly
+NOT made: `candidateTableOpts.policy.PinExhausted` is `false`, because the panel's own
+release bar (`candidateRow`/`candidateRowPriced`) DISCARDS an exhausted
+uncounted figure at every width too — pinning one in the table would spend
+the whole comparison protecting a figure the release bar itself does not
+guarantee. This is unaffected by the priced choice: it is a fact about what
+ONE layout's own ladder keeps, not about which of two layouts a render
+draws.
+
+**I13 holds with no per-surface exception — the priced choice is what
+closes it, not a sharper shed order.** A bare existence threshold — "the
+table exists" and "the table is drawn" as the same test — cannot make I13
+hold unconditionally, and the reason is structural: the table's width is
+the UNION over rows; `candidateRow`'s is one row's own cells. Six accounts
+each reporting `5h`, `7d` and ONE distinct model make eight columns
+costing 53 columns of terminal, while `candidateRow` states any one of
+those accounts' three figures in 37 — so across [37, 52] a table that
+merely EXISTS states strictly less than its own release bar, whatever the
+shed order sheds first. No reordering of the width ladder closes that band
+while existence and drawing are the same test: closing it at runtime would
+require the surface to be a table at 20, a per-row layout at 40 and a
+table again at 53 — two transitions, which I2's single false→true
+transition forbids outright — and the per-row layout's own figure set at a
+fixed width MOVES as a countdown shortens, so an extra transition would
+read the clock.
+
+A COMPARISON PRICED AT THE RENDER WIDTH ALONE IS NOT THE FIX EITHER, and
+that is a MEASUREMENT, not an assumption. `layoutScore`s compared at the
+render width alone correctly report the table `false` over [37, 52], but
+the SAME comparison, swept across every width, is not itself monotone —
+the property corpus catches it costing three of six figures on a panel
+exactly ONE COLUMN WIDER (29 → 30), because the table and the per-row
+layout are each individually monotone but at DIFFERENT rates, and a
+same-width comparison between two such curves can flip against a widening
+terminal. `releaseBar` is what the comparison must be priced against
+instead: it turns "does the table state at least as much" from an
+argument about the render into a condition priced against a CONSTANT —
+the per-row layout's score at `fullWidth` — so the set of widths at which
+the table wins is PROVEN upward closed rather than merely observed to look
+that way on one corpus. Over [37, 52] the table still loses exactly as a
+render-width comparison has it lose — `releaseBar` does not change WHETHER
+the table loses there, only guarantees the loss is confined to one
+contiguous band rather than scattered — so that band is where the surface
+renders per-row, on both surfaces, unconditionally (I13, above). WHY a
+table can lose there at all is untouched by the pricing: its columns are
+the union across rows, so every row still pays for every other row's
+windows (`layoutScore`'s own doc comment, above); the pricing does not
+eliminate that structural cost, it guarantees only that the cost is never
+passed to the reader as a shortfall, or as a flicker as the terminal is
+resized.
+
+**General isolation is unattainable, stated plainly — and the priced choice
+makes the DEPENDENCE it names strictly larger, never smaller.** A
+shared-column table buys a column for every row or for none, so one
+account's window can still cost another account a figure; the per-row
+victim rule (`dropTableGroup`) only reduces the magnitude, never eliminates
+it — I9 and I10 remain the honest, testable replacements for isolation
+within a chosen table. But the choice ITSELF is also a function of the
+whole roster, and in TWO ways at once: `candidatesText` and `monitorLayout`
+sum every row's per-row score into one `here` total before pricing it
+against the table's, so a mutation to one account that changes what its
+OWN row displays (adding a figure, losing a countdown) can move that sum
+past or below the `releaseBar` line and flip which LAYOUT every OTHER row
+on the surface is drawn through — a table row into a per-row line or back,
+for accounts the mutation never touched; and the table's own `fullWidth`,
+the reference the bar is priced at, is itself a function of every row's
+columns and countdowns, so the same mutation can also move WHERE (`ref`)
+the per-row layout is re-priced. I13's unconditional guarantee (above) is
+what bounds the consequence regardless: whichever layout a mutation
+elsewhere tips the surface into, every row still states no fewer figures,
+countdowns or span characters than its own release bar would at that
+width.
+
+**The corpus's EXISTENCE-first-fit widths (`tableFirstFitBaseline`).** This
+baseline is `minTableWidth`'s own value — the pre-check's floor (above),
+UNCHANGED by the priced choice — not the width at which a table is
+necessarily DRAWN. The narrowest terminal at which a table can EXIST for
+each corpus roster, panel then monitor: `real/scoped` with a configured
+axis 29 / 15; `real/dup` 41; `real/six` 72; `real/exhausted` 17 and 27;
+`real/scopedonly` monitor 25; a twelve-account real-model monitor 34; a
+thirty-account `all`-axis panel 81. Two properties account for most of the
+headroom a wide roster gets: a column costs what its figures cost rather
+than what its header spells (`measureColumns`, `headerLadders`), and
+existence is the single closed-form comparison `minTableWidth` computes
+before any layout runs. Where the panel's own release bar still states
+more than a just-barely-existing table at one of these widths, the priced
+choice draws the per-row layout instead, so the width at which the panel
+actually STARTS SHOWING a table can sit above this baseline; I13 is the
+guarantee that when it does, the reader has lost nothing by the wait.
 
 ## A19. `store.RotationEligible` — one owner for rotation eligibility; two audited limitations
 

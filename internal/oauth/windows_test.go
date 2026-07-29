@@ -4,6 +4,7 @@
 package oauth
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -220,5 +221,54 @@ func TestNewUsageProjectsSpendAndScoped(t *testing.T) {
 	}
 	if len(u.Scoped) != 1 || u.Scoped[0].Name != "Fable" || u.Scoped[0].ResetsAt != "2026-07-05T21:00:00Z" {
 		t.Errorf("scoped projection = %+v", u.Scoped)
+	}
+}
+
+// TestNewUsageDropsOnlyIncomparablePercentages fixes the projection guard and
+// its exact reach. A window whose pct cannot be COMPARED against a threshold
+// cannot gate an account either way — NaN compares false against every
+// threshold, an infinity compares true against all of them — so it is dropped
+// here, at the one projection every consumer reads, exactly as a non-numeric pct
+// is.
+//
+// A NEGATIVE pct is kept. It compares like any other number, it is not a width
+// hazard on any surface, and this projection is what `cswap list` and its --json
+// payload are built from: dropping one would change what every consumer says
+// about a window in order to buy a renderer nothing at all.
+func TestNewUsageDropsOnlyIncomparablePercentages(t *testing.T) {
+	nan := math.NaN()
+	inf := math.Inf(1)
+	for _, c := range []struct {
+		name string
+		pct  any
+		want bool // the window survives the projection
+	}{
+		{"ordinary", 42.0, true},
+		{"zero", 0.0, true},
+		{"over limit", 143.0, true},
+		{"negative", -5.0, true},
+		{"negative infinity", math.Inf(-1), false},
+		{"positive infinity", inf, false},
+		{"NaN", nan, false},
+		{"not a number at all", "42", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			u := NewUsage(map[string]any{
+				"five_hour": map[string]any{"pct": c.pct},
+				"scoped":    []any{map[string]any{"name": "Fable", "pct": c.pct}},
+			})
+			if got := u.FiveHour != nil; got != c.want {
+				t.Errorf("five_hour projected = %v, want %v", got, c.want)
+			}
+			if got := len(u.Scoped) == 1; got != c.want {
+				t.Errorf("scoped projected = %v, want %v", got, c.want)
+			}
+			if !c.want {
+				return
+			}
+			if w := RelevantWindows(u, []string{"all"}); len(w) != 2 || w[0].Pct != c.pct {
+				t.Errorf("relevant windows = %+v, want both carrying %v", w, c.pct)
+			}
+		})
 	}
 }

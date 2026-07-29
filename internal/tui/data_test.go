@@ -2,7 +2,11 @@
 package tui
 
 import (
+	"math"
+	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestFormatDuration(t *testing.T) {
@@ -69,7 +73,14 @@ func TestSentinelLabel(t *testing.T) {
 		"api key":              "API key (no quota)",
 		"keychain unavailable": "keychain unavailable — locked or in use; try again",
 		"re-login needed":      "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
-		"something else":       "something else", // fallback to raw
+		// An unmapped state is stated RAW, byte for byte as cswap list, the account
+		// card and the watch and switch screens state it — however long it is, and
+		// whether or not it has a space in it. What a narrow shared table may cut off
+		// such a string is a layout question, answered in the layout (spanFloor), and
+		// answering it here would reword every surface to serve one of them.
+		"something else":                   "something else",
+		"no credentials":                   "no credentials",
+		"usage_probe_failed_no_such_state": "usage_probe_failed_no_such_state",
 	}
 	for in, want := range cases {
 		if got := sentinelLabel(in); got != want {
@@ -143,6 +154,116 @@ func TestCandidateWindowsCarryResetsAt(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("cell %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestCandidateWindowsRejectUnusablePercentages fixes the projection guard, and
+// its exact reach: a window whose pct cannot be COMPARED against a threshold
+// does not exist. NaN compares false against every threshold and an infinity
+// compares true against all of them, so a window carrying one could neither gate
+// an account nor be ranked; dropping it at the projection is what makes the
+// engine, the ranking and every rendered surface agree that there is nothing
+// there.
+//
+// A NEGATIVE pct is NOT dropped. It compares like any other number, and this
+// projection is what reporting and `cswap list --json` read too — so rejecting
+// one would change what every consumer says about a window to buy the TUI
+// nothing at all.
+func TestCandidateWindowsRejectUnusablePercentages(t *testing.T) {
+	nan := math.NaN()
+	inf := math.Inf(1)
+	for _, c := range []struct {
+		name string
+		lg   map[string]any
+		want []string
+	}{
+		{"NaN five hour", windows(nan, 88), []string{"7d"}},
+		{"infinite seven day", windows(12, inf), []string{"5h"}},
+		{"negative five hour", windows(-3, 88), []string{"5h", "7d"}},
+		{"NaN scoped", windows(12, 88, scopedWindow{"Fable", nan}), []string{"5h", "7d"}},
+		{"negative scoped", windows(12, 88, scopedWindow{"Fable", -1}), []string{"5h", "7d", "Fable"}},
+		{"all unusable", windows(nan, inf), nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var got []string
+			for _, w := range candidateWindows(c.lg, []string{allModelsSentinel}) {
+				got = append(got, w.Label)
+			}
+			if strings.Join(got, ",") != strings.Join(c.want, ",") {
+				t.Errorf("candidateWindows = %v, want %v", got, c.want)
+			}
+			// The headroom the engine decides with reads the same projection, so a
+			// dropped window may not linger in the ranking either.
+			if len(c.want) == 0 && bindingPct(c.lg, []string{allModelsSentinel}) != nil {
+				t.Errorf("bindingPct = %v, want nil: no window is usable",
+					*bindingPct(c.lg, []string{allModelsSentinel}))
+			}
+		})
+	}
+}
+
+// TestCandidateWindowsCarryTheMeasuredPercentage fixes what the projection
+// carries and the one place exhaustion is decided: the cell holds the number the
+// store reported, unclamped, and says it has run out through Exhausted rather
+// than through a threshold each surface re-derives.
+func TestCandidateWindowsCarryTheMeasuredPercentage(t *testing.T) {
+	got := candidateWindows(windows(99.4, 1e9, scopedWindow{"Fable", 100}), nil)
+	want := []candidateWindow{
+		{Label: "5h", Pct: 99.4, Counted: true},
+		{Label: "7d", Pct: 1e9, Counted: true, Binding: true, Exhausted: true},
+		{Label: "Fable", Pct: 100, Exhausted: true},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidateWindows = %+v, want %d cells", got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("cell %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestPctTextElidesRatherThanRewrites fixes the display bound and its honesty:
+// a figure past displayPctCap is ELIDED behind a marker, never respelled as the
+// cap. Every shared-column layout sizes a column to the widest figure in it, so
+// an absurd stored measurement must not set the width of a column every account
+// pays for — but a bare "999%" would state a measurement the store never
+// reported, while the account card and cswap list, reading the same entry, print
+// the real one.
+//
+// BOTH TAILS are bounded, and the negative one is not hypothetical: the
+// projection drops NaN and ±Inf but deliberately keeps a negative utilization
+// (oauth.pctFloat), so a store reporting -1e9 would otherwise spell eleven
+// columns into a column every account on the screen pays for — and, through
+// minTableWidth, could take the table away from all of them to do it.
+func TestPctTextElidesRatherThanRewrites(t *testing.T) {
+	for _, c := range []struct {
+		pct  float64
+		want string
+	}{
+		{0, "0%"},
+		{99.4, "99%"},
+		{100, "100%"},
+		{-3, "-3%"},
+		{displayPctCap, "999%"},
+		{displayPctCap + 1, ">999%"},
+		{1e9, ">999%"},
+		{-displayPctCap, "-999%"},
+		{-displayPctCap - 1, "<-999%"},
+		{-1e9, "<-999%"},
+	} {
+		if got := pctText(c.pct); got != c.want {
+			t.Errorf("pctText(%v) = %q, want %q", c.pct, got, c.want)
+		}
+	}
+	// The bound is what the layout needs: whatever the number, and whichever
+	// direction it runs in, the figure is at most six columns wide, so one
+	// garbage measurement cannot widen a shared column without limit.
+	for _, pct := range []float64{1e300, -1e300} {
+		if w := lipgloss.Width(pctText(pct)); w > lipgloss.Width("<-999%") {
+			t.Errorf("pctText(%v) is %d columns wide, want at most %d",
+				pct, w, lipgloss.Width("<-999%"))
 		}
 	}
 }

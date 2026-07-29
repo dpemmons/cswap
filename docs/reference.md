@@ -1583,54 +1583,353 @@ than ranking it as a target, since quarantine is transient and clears
 itself once the account's stored credential is replaced. Recovery is
 logging in with the account and running `cswap add`.
 
-A candidate row with a readable usage figure lists every rate-limit window
-the account reports, not only the one it is ranked by: `5h`, `7d`, and one
-entry per per-model weekly window the account carries, each rendered as
-`<label> <pct>% (resets <duration>)` and joined on the one line, in that
-fixed order (`5h`, then `7d`, then the account's own per-model windows).
-The countdown is recomputed from the window's reset timestamp at render
-time, never served from the countdown string the measurement was fetched
-with: a stored string is correct only at fetch time and drifts as the
-measurement ages. A window whose reset has already elapsed reads `(resets
-now)`; a window whose reset timestamp is absent or unparseable carries no
-parenthetical at all. Which windows count
-toward the row's rank — and toward the auto engine's own pick — is a
-narrower set: `5h` and `7d` always, plus a per-model window named by
-`autoswitch.model` (see SETTINGS below). Every other per-model window still
-renders — so a window can be watched before it is configured to matter —
-but never moves the row's rank. The highest percentage among the counted
-windows is the row's binding window: the same figure the row is ranked by
-and the one the engine acts on. Its label and percentage render bold, in
-the usual severity color; the row's other counted windows render in the
-ordinary readable style; its uncounted windows render muted, so the three
-kinds read apart at a glance. A countdown takes its cell's kind but is
-never bold, including inside the binding cell: the percentage is the
-figure the row is ranked by, and the countdown supports it. The panel header states the counted axis once — `Next best ·
-counting 5h, 7d`, or, with `autoswitch.model` set, `Next best · counting
-5h, 7d, Fable` (`Next best · counting 5h, 7d, all models` for the `all`
-sentinel) — so an uncounted window's muting reads as a stated rule rather
-than an unexplained dimming.
+A candidate with a readable usage figure lists every rate-limit window the
+account reports, not only the one it is ranked by, laid out as one shared
+table rather than repeated per row: a header line names each window once,
+in a fixed relative order — `5h` before `7d` before every per-model weekly
+window — regardless of which candidate's row happens to report one first.
+The per-model columns follow those two, ordered by name. No part of the
+header depends on the ranking: were a column's place decided by which
+candidate happens to report it first, an account reporting only a `7d` figure
+ranked ahead of one reporting both would print `7d` before `5h`, and two
+accounts reporting different models would swap their columns as they
+re-ranked — the header reshuffling itself from one poll to the next with no
+resize and nothing about any account changed, which no other usage display in
+`cswap` does, since the account card, the minimized account line, and
+`cswap list` all read `5h` before `7d` always. Every candidate below the header supplies only its own figures
+under those headings. A candidate that does not report a given column's
+window shows an em dash there, in plain muted text rather than an empty
+cell — plain, never the dimming an unmatched window's own figure carries
+and never the color an exhausted one's would, so a missing figure is never
+mistaken for either.
 
-No line in the panel ever wraps, regardless of terminal width — the header,
-a readable usage row, a quarantined/sentinel/usage-unknown row, and the
-empty-state "no other switchable accounts" line alike. A readable usage row
-that does not fit narrows one reduction at a time, in this order: the
-countdowns of its uncounted windows, then those windows entirely, then the
-countdowns of its counted windows other than the binding one, then those
-windows entirely, then the binding window's own countdown, and last the
-email, which truncates with an ellipsis. A countdown always goes before the
-window carrying it, and a whole class goes before the next more informative
-one; within a class the rightmost cell gives ground first. The binding
-window's label and percentage — the row's ranking key — are on no rung and
-survive every reduction. A quarantined, sentinel, or usage-unknown row carries no window
-cells to drop, so it narrows differently: the email truncates first, down
-to a bare ellipsis, and only once the email is gone does the label itself
-lose its tail to an ellipsis; the slot number always survives, and the
-label's own wording is truncated, never reworded. The header and the
-empty-state line carry neither windows nor a label and, when the terminal
-is narrower than the text itself, clip as a whole line with a trailing
-ellipsis. Any line that still does not fit after its own narrowing
-truncates as a whole line rather than wrap.
+A quarantined, sentinel, or usage-unknown candidate reports no window at
+all and so occupies no column: its row carries the reason in place of the
+figures, starting right after that row's OWN email and running to the row's
+own width budget from there — not a column shared with the window rows, so
+two labeled rows can start their reasons at different columns when their own
+emails differ in length. What IS shared, and laid out against the SAME
+width on every row, is how far the identity column as a WHOLE may narrow: a
+labeled row's own reason may narrow it only as far as the reason's own
+guaranteed floor requires, never by its full length: a single long reason
+(the re-login sentinel's note runs to 82 characters) narrowing the shared
+column on behalf of its own full text would buy itself room out of every
+OTHER candidate's email, on the panel and the monitor alike. The floor a
+reason is guaranteed is its classifying first word plus a trailing
+ellipsis — "quarantined…", "re-login…", "usage…" — since "quarantined",
+"re-login", or "usage" is the reason's classification, and a cut landing
+inside that word ("quarantin…") would state nothing a reader could act on;
+the reason never clips shorter than that, or the whole reason when it is
+already shorter. A reason with no word to keep — an unrecognized state
+identifier the store reported verbatim, carrying no mapped wording of its
+own — has no classification to protect, so it may clip inside itself once
+it runs past twelve columns; a prefix of an identifier still identifies it
+as well as anything short of the whole does. Down to that floor, and no
+further, does a labeled row's
+reason narrow the shared identity column; a reason that still does not fit
+past that point clips ITSELF instead, in its own color — the warning color
+for a quarantine reason, muted for a sentinel or "usage unknown" — never the
+plain muted marker a narrowed email carries. Because the reason is drawn
+against that row's OWN email rather than the widest one on the panel, a row
+whose own email is shorter than the panel's widest is charged nothing for
+the difference and states more of its reason than the shared floor alone
+guarantees. In practice this means a labeled row spends its OWN email first
+as the terminal narrows — clipping toward its own bare ellipsis while its
+reason stays whole — and only once its own email is fully spent does the
+reason itself begin to clip, toward its floor. The shared identity column
+every OTHER row's email draws from is a separate, later concession: it
+narrows only once even the widest reason's floor no longer fits beside a
+full shared column, and even then it costs a row nothing until its own
+email would not have fit the narrower column anyway. A width too narrow to
+hold even a table's widest floor
+is not a width this table renders a reason row at all — it is a width at
+which the table gives up, in its entirety, the same way it gives up when a
+readable row's slot number and fully-narrowed email do not fit: never a row
+stating half a reason, never a row stating none.
+
+A cell holds two figures: the utilization percentage, right-aligned, and
+beside it, in its own aligned sub-column, the reset countdown, left-aligned.
+Each column is exactly as wide as its widest FIGURE, so a percentage always
+sits under its heading regardless of how many digits it or its neighbors
+carry — and a column costs what its numbers cost, never what its window is
+called. A utilization past 999%, in either direction, prints as `>999%` or
+`<-999%` rather than the true figure, so one absurd measurement never sets
+the width every account on the row pays for; the ranking, the severity
+color, and whether a window counts as exhausted are unaffected and still
+read the real, unbounded number. The
+account card and `cswap list` do not share a column with any other account
+and always print the real figure, however large. A heading too wide for the
+room it sits over is shortened instead, and
+every heading on the row is shortened together, never past the point at which
+two different models would read alike: an ambiguous heading is terse, a
+colliding one is false. So the same three accounts cost the same width whether
+their model is called `Fable` or `claude-opus-4-5-20251101`. On this panel a
+heading never shortens past four columns — a whole syllable — because the
+panel's own per-line fallback (below) always spells a model's name in full,
+and a heading trimmed any further would name a window worse than that
+fallback does. The countdown is recomputed from the window's reset
+timestamp at render time, never served from the countdown string the
+measurement was fetched with — a stored string is correct only at fetch time
+and drifts as the measurement ages — and reads `now` once the reset has
+elapsed, or nothing when the reset timestamp is absent or unparseable. It
+keeps the wording `cswap tui` uses everywhere else (`2d 4h`, `6d`, `now`),
+minus the leading "resets": the column heading above it already names the
+window, so the cell does not repeat it on every row.
+
+Which windows count toward a row's rank — and toward the auto engine's own
+pick — is a narrower set: `5h` and `7d` always, plus a per-model window named
+by `autoswitch.model` (see SETTINGS below). Every other per-model window
+still gets a column — so it can be watched before it is configured to
+matter — but never moves any row's rank. Emphasis is per cell, not per row,
+since which window binds a candidate's rank varies from row to row within
+one column, and it reads three ways, not two. Severity color states what a
+figure MEANS, and every COUNTED figure carries it — the same color the
+account card's bars, the monitor's own per-row fallback line, and
+`cswap list` already show a used-up window in — whether or not that figure
+happens to be the one the row is ranked by. A window that has run out — at
+or over its limit — carries that same severity color too, whether or not it
+counts: an EXHAUSTED figure is the single most important number on its row,
+the one that says the account cannot serve that window at all, and it never
+fades into the muted background merely because nothing presently counts it.
+Bold states a third, separate fact: which figure the ranking and the engine
+act on. Only the binding window — the counted window with that row's
+highest percentage — renders bold; a counted window that is not binding
+carries the identical severity color, not bold, and neither does an
+exhausted-but-uncounted one, since bold marks the ranking figure and an
+uncounted window is never that. Only a window that is BOTH uncounted and
+short of its limit carries neither color nor bold: muted and dim. This
+third level matters most on the dashboard's accounts monitor, whose columns
+are never counted at all — its ranking axis is always the bare `5h`/`7d`
+pair, never `autoswitch.model` — so without it a per-model window that had
+run completely out would read there exactly as one sitting at 40% does; the
+per-row layout the table replaces has always flagged that case outright (as
+`Fable (!)`, further below), and the table states the same fact in color
+rather than in nothing. A countdown beside a cell always stays
+muted and never bold, whichever cell it sits beside and whichever of the
+three levels its own figure carries, since a reset time is supporting
+detail and never the ranking figure itself.
+
+An account that reports two windows under the same display name — two
+per-model weekly windows sharing a name is the practical case — gets two
+columns of that name, not one shared column: the table never merges same-
+label figures from one row into a single cell. A merge would have to pick
+which of the two figures a reader sees and which one is silently dropped,
+the row's ranking figure among the candidates for dropping, so the table
+gives every reported window its own column instead, at the cost of a
+repeated heading exactly when, and only when, an account repeats a label.
+Whichever windows a row reports and however its labels land, one fact never
+varies: the cell carrying the row's ranking figure is on the table, and it
+is the row's one bold cell.
+
+A column heading is always muted, and additionally dim when its window is
+uncounted on the currently configured axis, so a dimmed heading and the
+header's own `Next best · counting 5h, 7d` note (`Next best · counting 5h, 7d, Fable` with
+`autoswitch.model` set; `Next best · counting 5h, 7d, all models` for the
+`all` sentinel) always agree about which columns matter to the ranking.
+
+No line of the table ever wraps, regardless of terminal width. A table that
+does not fit narrows one reduction at a time, re-measuring after each: the
+column headings shorten first, all together, down to the narrowest spelling
+that still tells two different models apart — a heading names a column
+whose figures are on the screen regardless of how it is spelled, so it gives
+ground before anything a reader cannot infer some other way does. Once every
+heading is at its narrowest, the countdowns give way next: uncounted
+columns first, then counted ones, rightmost column first within each, with
+the ranking figure's own countdown held back to last on this panel — the
+same order this panel's per-line layout gives them up in. Then the row's
+email narrows toward a bare ellipsis, because a row's figures are what the
+row is there to show and the slot number alone still identifies it once the
+email is gone; a labeled row's reason concedes the other way around, itself
+first and this shared column only once its own floor is reached (above).
+Only past that does a whole column go.
+
+Three kinds of column never go at all. A counted one — some row's rank may
+rest on exactly that column, and dropping it would hide that row's ranking
+figure to make room for a column that matters less to every other row. The
+column carrying any row's own ranking figure, or, for a row nothing counts on
+at all, its highest figure — so no account is ever left a line of bare dashes.
+And, on the accounts monitor, a column some account has exhausted (used up, at
+or over 100%) in: a window that has run out is the single most important
+figure on that row, and that monitor's own per-line layout states it
+unconditionally, so the table does too. This panel does not pin an exhausted
+per-model column, because its own per-line layout drops that figure at every
+width as well; pinning it here would cost the whole panel its table to protect
+something the layout replacing it then discards.
+
+Among the columns that CAN go, the one the FEWEST accounts report goes first —
+a model one account reports before a model three do — and all the columns of
+one model name go together or not at all, so an account that does report that
+model is never shown a dash under a heading it belongs under. A table that has
+dropped columns says so, once, at the end of its heading row: a muted `+2`.
+
+The width below which no table can exist at all is not a fixed column count
+and is not guesswork: it is the width of the fully narrowed table — every
+droppable column gone, every heading at its shortest, every email down to
+its ellipsis — and it moves with the data, more pinned columns, longer
+labels, a longer reason or a wider slot number all pushing it out. Below
+it the panel never attempts a table; laying out each candidate on its own
+line is the only option there is.
+
+At or above that width a table CAN be built, but building one is not
+reason enough to show it. Comparing the two layouts at the SAME width
+turns out not to be safe on its own: a table and a candidate's own line
+each grow more informative as the terminal widens, but not always at the
+same pace, so a bare side-by-side comparison taken at one width can favor
+the per-line layout, then the table, then the per-line layout again as the
+terminal keeps growing — measured, not hypothesized: on real rosters the
+naive comparison can cost several figures on a panel exactly one column
+WIDER, the opposite of what widening a terminal is supposed to do. So the
+panel instead prices the table against a FIXED target: what each
+candidate's own line would state at the width the table itself needs to
+show everything it has, never at the narrower width actually on screen.
+Because a candidate's own line only ever gains detail as it is given more
+room, that fixed target already states at least as much as comparing at
+the render width would demand, and it does not move as the terminal is
+resized — which is what keeps the comparison well behaved as the terminal
+grows: once a wider terminal earns the table, every terminal wider still
+keeps it.
+
+The fixed target depends on neither the width of the terminal nor on
+anything that changes between two polls of the same terminal. It does not
+depend on how long any one candidate's reason is: sizing it by the widest
+reason on the panel would let one account's own text — not even shown at
+the width in question — decide whether every OTHER account gets the
+table, so a reason costs nothing beyond its own row. Nor does it read a
+clock: every reset countdown priced into it is stated at the widest a
+countdown's wording can ever be, never at how much time a window actually
+has left, so the choice between the table and the per-line layout is the
+same at every moment a terminal holds still — a countdown ticking down
+between two polls narrows what a chosen layout draws; it never flips which
+layout is chosen.
+
+Held to that fixed target, the panel counts what each layout actually puts
+on the screen: how many utilization figures survive whole, how many reset
+countdowns survive whole, and, for a quarantined, sentinel, or
+usage-unknown row, how many characters of its reason survive the cut. The
+table is drawn only when it states no fewer of each of those than the
+per-line layout would; the moment it states fewer of any one of them, the
+whole panel falls back instead, to laying out every candidate on its own
+line — `5h 12% (resets 3h 20m) · 7d 88% (resets 2d 4h) · Fable 40%
+(resets 6d)`, narrowing on its own down to a bare slot number, a labeled
+row narrowing its email before its reason. A tie goes to the table: where
+both layouts would state the same figures, the same resets and the same
+reasons, the table's aligned columns are pure gain the reader pays nothing
+for. The choice is a property of the whole panel, never of one row: at a
+given width every candidate goes through the table or every candidate goes
+through the per-line layout.
+
+The reason a wider shared table can still lose this comparison is
+structural, not a defect in how it narrows. Its columns are the union
+across every candidate, so a row pays the width of every OTHER candidate's
+windows too — including an em dash under a column it has nothing to
+report there — while a candidate's own per-line layout pays only for what
+that candidate has. On a roster where accounts report different per-model
+windows, the table can therefore end up stating the same figures spread
+over more columns, and buys the room by shedding countdowns a candidate's
+own line still affords. No reordering of what narrows first changes that;
+it is the price a shared column pays for lining every account's figures up
+under one heading, and it is why the comparison, not the width alone,
+decides which layout a reader sees.
+
+One thing this comparison deliberately leaves out: how much of a
+candidate's own identity — the alias or email — is on the screen. A
+shared table buys its column alignment out of that very cell, so weighing
+identity in the same comparison would refuse the table at exactly the
+widths where lining every account's figures up under one heading is what
+it is for; the slot number still names the account for `cswap switch`
+either way. Identity is measured, not compared, and it is the one respect
+in which the panel does not simply give back more of everything as the
+terminal widens: at the exact width where the panel switches into table
+mode, the visible email can be SHORTER than it was one column narrower, in
+the per-line layout the panel just left behind.
+
+The dashboard's always-visible accounts monitor (the panel above the menu on
+the main screen) lays its non-active accounts out through this same table,
+so a window reads the same way in both places. Each row's label cell carries
+the account's identity exactly as it always has: the alias form
+`alias (email)` when an alias is set, else the bare email, then `[tag]`,
+then a `(disabled)` marker in the warning color when the account is
+disabled. Which windows count stays `5h` and `7d` here regardless of
+`autoswitch.model` — the axis this monitor has always used — so a per-model
+window is always an uncounted column: muted and dim short of its limit, but
+carrying its full severity color, the same as a counted figure, from the
+moment it runs out — an exhausted per-model window is the one figure on
+that row a reader most needs to see, on this axis or any other. A sentinel
+state or an account with no usable measurement carries its reason the same
+way a candidate's does on the panel: the row's own email narrows first,
+down to a bare ellipsis, then the reason itself narrows toward its own
+floor, and only past that point does the shared label cell narrow in turn.
+The table is laid out once across every non-active
+account, so its columns still line up above and below the active account's
+own full card wherever
+that account falls in roster order — the active account is not moved to
+the top, and its card can visually split the table into two blocks that
+still share one column layout.
+
+Narrowing inside a table follows the identical ladder wherever a table is
+built, but the monitor's fallback is its own long-standing one-line-per-account
+shape, not the panel's: only `5h` and `7d` appear, a reset countdown appears
+only once that window has reached 100%, and a per-model window appears only
+once it too has reached 100% (as `Fable (!)`). Because that fallback never
+names a per-model window until it has run out, a heading on this table may
+shorten all the way to two columns — the width of `5h`/`7d` and of a
+percentage — rather than stopping at the panel's four-column syllable floor:
+there is no fuller naming here for a shorter heading to fall short of.
+
+Which shape renders is decided by the identical priced comparison the panel
+makes, not by fitting alone: below the width at which a table can exist at
+all, the monitor shows every account on its own mini line, the same shape
+it has always used. At or above that width, existence is necessary but not
+sufficient — the monitor prices the fully-shed table against what the mini
+lines would state, and shows the table only where it states no fewer
+utilization figures, reset countdowns, and characters of a sentinel or
+unusable account's reason than the mini lines would. On this surface that
+comparison is close to a formality rather than a real contest: the mini
+line's own long-standing contract already states nothing the table's
+protected columns do not also guarantee, so a terminal wide enough for the
+table almost never finds the mini lines ahead on any count — unlike the
+panel, where the comparison regularly decides things. Table mode does not
+imply the full picture even so: the table can already have dropped an
+uncounted column's countdown, or the column itself, and still be the one
+shown, so a terminal only wide enough for a heavily-shed table still
+renders in table mode with a countdown or a per-model column missing. Only
+once the fully-shed table — its label narrowed to a bare ellipsis, every
+droppable column gone, every heading at its shortest — no longer states at
+least what the mini lines would, does the monitor fall back, in its
+entirety, to this narrower shape rather than wrapping or clipping the
+table. That narrower shape is itself held to the terminal's width: it clips
+its own line, like everything else on the monitor, rather than running off
+the screen. The one thing this comparison leaves out, here as on the
+panel, is how much of an account's own alias or email is on the screen:
+the table can show a shorter one at the width where it takes over than the
+mini line showed one column narrower.
+
+The dashboard also caps how many lines this monitor may use when the
+terminal is too short for both it and the menu below, dropping trailing
+accounts behind a muted "· N more accounts" note. This is a SECOND,
+independent price, layered on top of the comparison above: that first
+comparison decides table against per-row shape by what each states at the
+FULL content width; the height cap, only when the monitor does not fit the
+terminal's height at all, prices the same two shapes again under a fixed
+LINE budget instead, counting accounts shown rather than figures,
+countdowns, or reason characters, and can still choose the per-row shape
+even where the first comparison favored the table. The table's column
+header is bound to the first non-active account's row for that cap: a
+budget too small for that row drops the header along with it, so the
+monitor never shows a header naming columns with no row visible under it,
+and never drops the header while a row it describes is still shown.
+
+That header spends a line the monitor's per-row, one-line-per-account shape
+does not, and at a tight budget a line is an account, so the cap prices the
+SAME budget in both shapes and keeps whichever shows more of them. The
+table wins unless the per-row shape fits strictly more accounts at that
+budget, or fits exactly as many while also keeping the muted "· N more
+accounts" note where the table's own attempt loses it — in either case the
+monitor renders in the per-row shape instead, buying back the line the
+header cost. A budget too tight for either shape to keep
+the note at all renders as the table regardless (with its lone-header
+rescue, above): the column header naming what is on screen is what is left
+to show, in place of a count of what is not.
 
 ### Files
 
@@ -2087,9 +2386,11 @@ This matching decision is visible, not just enforced: `cswap tui`'s
 auto-switch screen (above) lists every per-model weekly window an account
 reports in its "Next best" candidates panel whether or not `autoswitch.model`
 names it, but only a window this setting matches counts toward that row's
-binding percentage and rank. An unmatched window renders — muted — for
-visibility alone, so a user can watch a model's weekly window climb before
-deciding to fold it into the switching decision.
+binding percentage and rank. An unmatched window renders muted for
+visibility alone while it still has room left, so a user can watch a
+model's weekly window climb before deciding to fold it into the switching
+decision; once it runs out it carries its usual severity color regardless
+of the match, the same as any other exhausted window (above).
 
 ## EXIT STATUS
 

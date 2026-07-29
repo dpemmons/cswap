@@ -9,6 +9,7 @@
 package oauth
 
 import (
+	"math"
 	"strings"
 	"time"
 )
@@ -58,7 +59,7 @@ type RelevantWindow struct {
 
 // NewUsage projects a normalized usage map (as produced by BuildUsageResult or
 // read back from usage.json) into the typed Usage struct, or nil when the map
-// is nil/empty. A window with a non-numeric pct is dropped (mirrors the
+// is nil/empty. A window with an unusable pct is dropped (mirrors the
 // isinstance(pct, (int, float)) guard in relevant_windows), so a projected
 // FiveHour/SevenDay is present iff its pct is usable for a decision.
 func NewUsage(normalized map[string]any) *Usage {
@@ -77,7 +78,7 @@ func NewUsage(normalized map[string]any) *Usage {
 				continue
 			}
 			name, nameOK := m["name"].(string)
-			pct, pctOK := numFloat(m["pct"])
+			pct, pctOK := pctFloat(m["pct"])
 			if !nameOK || name == "" || !pctOK {
 				continue
 			}
@@ -91,12 +92,34 @@ func NewUsage(normalized map[string]any) *Usage {
 	return u
 }
 
+// pctFloat coerces a window's pct to the float64 a DECISION may be made on: a
+// JSON or Go number that is COMPARABLE against a threshold. NaN and ±Inf are
+// not — NaN compares false against every threshold and an infinity compares true
+// against all of them, so a window carrying one cannot gate an account either
+// way — and they are rejected here, at the one projection every consumer reads,
+// so the window is dropped exactly as a non-numeric pct is and everything
+// downstream (headroom, the ranking, every rendered surface, the JSON) sees one
+// consistent answer: the window does not exist.
+//
+// A NEGATIVE pct is not rejected. It compares fine, it is not a width hazard,
+// and it is a measurement this projection has always passed through to
+// reporting and to every JSON consumer — dropping it would silently change what
+// `cswap list --json` says about a window, which is a far larger change than the
+// comparability guard this function exists for.
+func pctFloat(v any) (float64, bool) {
+	f, ok := numFloat(v)
+	if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
+}
+
 func projectWindow(v any) *Window {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return nil
 	}
-	pct, ok := numFloat(m["pct"])
+	pct, ok := pctFloat(m["pct"])
 	if !ok {
 		return nil
 	}
