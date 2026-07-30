@@ -697,6 +697,16 @@ committed under `testdata/` to enforce data compatibility.
     `candidatesText`) also excludes `acc.Disabled`; the account card and
     mini-line `(disabled)` marker renders in the warning color rather than
     muted. See A18.
+12. **Dashboard account submenus are rebuilt from every snapshot, and a
+    per-account action re-validates its target** — Python builds the remove and
+    disable submenu rows once, at push time, and stores them in the menu stack
+    frame (spec 09§3.2); nothing on the dashboard watches the snapshot, so the
+    rows go stale against the accounts monitor rendered directly above them and
+    a stale row's action fires against a slot that may no longer hold the
+    account named on it. The Go port makes the dashboard a `snapshotObserver`
+    and re-derives those rows, re-validates every per-account action against the
+    live roster before acting, and reports actions that previously succeeded in
+    silence. See A21.
 
 ---
 
@@ -2970,3 +2980,160 @@ few microseconds the refusal takes before releasing it. A read-only command
 that does not take the lock is unaffected; a second write-capable command
 queued behind the refusal waits only that long — no different in kind from
 waiting behind any other short-lived acquisition.
+
+---
+
+## A21. Dashboard account submenus: live rows, re-validated targets (Go-side deviation from Python)
+
+The dashboard is a monitor above a menu. The monitor
+(`internal/tui/widgets.go` `accountsPanelText`) is rebuilt from `Model.snapshot`
+on every frame. The menu is a stack of `(title, entries)` frames, and two of
+those frames — "remove account" and "disable / enable" — carry one row per
+account, each row's number, email, alias, org tag and disabled state baked into
+a pre-formatted label.
+
+Those rows were computed once, when the frame was pushed. Python does the same
+(spec 09§3.2 defines no snapshot watcher on the dashboard; the `_dirty` rebuild
+tick at 09§10 belongs to the macOS menu-bar surface, a different program), and
+the Go port reproduced it faithfully. `Model.applySnapshot` fans each completed
+pass out to `snapshotObserver` implementations only — `switchScreen`,
+`watchScreen`, `autoScreen` — and `dashboardScreen` was the one screen on the
+stack that was not one. Nothing ever told it the roster had changed.
+
+The result is visible on one screen at one time: remove an account and the
+monitor loses it immediately while the menu below keeps offering it. Both halves
+are rendered from the same `Model`, in the same frame, and they disagree. Selecting
+the stale row resolved its email through the `"?"` fallback, produced the
+confirmation `Remove account 3 (?)?`, and failed in `store.ResolveAccount`.
+
+### RULE 1 — a frame whose rows are one per account is rebuilt from every snapshot
+
+`menuFrame` carries an optional `build func(*Model) []menuEntry`
+(`internal/tui/dashboard.go`). `pushLiveMenu` sets it; `pushMenu` — for the root
+and add frames, whose rows are fixed text — leaves it nil.
+`dashboardScreen.onSnapshot` rebuilds every frame that has one, not only the
+visible one: the stack is two deep today, and a stale frame under the top one is
+the same defect deferred.
+
+This subsumes a second defect. `disableEntries` froze the toggle direction
+(`→ disable` / `→ enable`) into the label, while `Model.toggleDisabled` read
+`acc.Disabled` from the live snapshot and inverted it — so a row could state the
+opposite of the mutation it fired. The two halves now read one snapshot.
+
+### RULE 2 — the cursor follows its action, and parks on the back row when that action is gone
+
+`remapMenuIndex` looks the selected row's `actionID` up in the rebuilt rows. When
+it is absent — the account was removed — the cursor goes to the back row, never to
+whichever account slid into the vacated position: these rows are the dashboard's
+destructive action surface, and a cursor sitting where a removed account used to
+be invites the next Enter to act on its neighbour.
+
+There is no "nothing changed, skip the remap" guard. A lookup that finds the
+action finds it where it already was, so the common case — a routine usage
+refresh, or the relabelling a disable toggle causes — is invariant by
+construction. `accountListScreen.onSnapshotBase` needs such a guard because it
+rebuilds a whole widget list; this rebuilds a slice and re-derives one integer.
+
+The identity followed is the **slot**, not the account: `actionID` is
+`remove:<number>`, and a slot emptied and refilled carries the cursor to its new
+occupant. RULE 3 is what makes that safe rather than merely likely-safe.
+
+### RULE 3 — a per-account action re-validates its target against the live roster
+
+Making the rows live, on its own, makes the surface **less** safe. The frozen
+frame failed closed: a vanished number produced `(?)` and `store.ResolveAccount`
+refused, so nothing was deleted. Live rows make every confirmation name a real,
+existing account, so a snapshot landing between the keypress and the dispatch
+silently retargets the action — and `Model.applySnapshot` fans out to every
+screen in the stack, so the cursor also moves while the frame is behind a modal
+or under a pushed screen, with no rendered transition to notice.
+
+Two checks, at the two points where the roster can have moved:
+
+- `dashboardScreen.dispatch` refuses a `remove:` or `disable:` whose number is no
+  longer in the snapshot. The `disable:` path has no confirmation modal by design
+  (09§3.3) and pops its frame either way, which made it the one that most needed
+  this: `Model.toggleDisabled`'s nil return for an unknown number was silent, so
+  the user was returned to the root menu having been told nothing at all.
+- `Model.confirmRemove` captures `(email, organizationUuid)` at push time and
+  re-checks it in `onDone`. The poll runs while the modal is up — `Update` handles
+  `pollTickMsg` whatever screen is top — so the sentence on screen can go stale
+  before it is answered. The test is the composite, not the email alone, because
+  an email alone cannot tell two same-email accounts apart: the same test
+  `lifecycle.RemoveAccount` applies under its own lock, for the same reason.
+
+### RULE 4 — an action that changed something says so
+
+`runAction` returns an empty `Message` on success, and `Model.actionDone` raised a
+toast only for a switch payload, a `showOutput` action, or a non-empty first line.
+Remove and disable satisfy none of the three and so succeeded in total silence;
+the monitor losing a row one poll later is not an acknowledgement, it is a second
+thing to interpret. Both now raise the completion toast the `showOutput` branch
+already used (Deviation #7). Failures are unaffected — they still open the output
+modal.
+
+This also has to land with RULE 1 rather than after it. The disable frame pops to
+the root menu after acting, which is where the amber `(disabled)` markers become
+visible; that pop was the disable path's only user-visible acknowledgement, and
+anything that removes it — including making the frame worth staying in — must
+replace it first.
+
+### RULE 5 — a frame that lists the roster is the only thing on screen that lists the roster
+
+While an account-listing frame is on top, the monitor renders with `showMinis`
+false: the active account's card, and nothing else. The screen states where you
+are once and what you can pick once, instead of the same roster twice in two
+different vocabularies. The active card stays because removing the account you
+are signed in to is a different act from removing any other, and the frame's
+rows carry the markers that were missing from them entirely — `● active` and
+`(disabled)`, in the card's order and colours (`stateNotes`).
+
+The collapse has to reach both branches of `dashboardScreen.view`. The fitting
+branch renders the panel it measured. The overflow branch re-renders under a
+height budget through `cappedPanel`, which routes to `accountsMonitorCapped` only
+when the minis are on: that function hardcodes them, so routing the collapsed
+panel through it would put the roster back on screen under the very menu that
+lists it, and at a one-line budget it spends the line on its "N more accounts"
+indicator, which names nothing. With the per-account rows collapsed there is
+nothing elided to count, so the budget simply takes the card's leading lines,
+identity first.
+
+`menuRow` now also holds its row to the terminal width. The account rows are built
+from an email, an alias and an org name, so their length is roster data rather than
+layout — a realistic disable row measures 51 columns — and the never-wrap property
+sweep (I1) does not reach this surface. Two further gaps in that sweep are recorded
+but not closed here: `accountListScreen.renderList` hands its cards to
+`accountCardText`, whose header never consults `width` at all, so the Switch and
+Watch screens wrap unconditionally for a long alias + email + org.
+
+### Audited limitations
+
+**(i) The cursor tracks a slot, not an account identity.** A slot emptied and
+refilled between two polls carries the cursor to its new occupant. The row's label
+is rebuilt from the same snapshot, so that occupant is named where the cursor sits,
+and RULE 3 re-validates before anything is deleted — so the residual is a cursor
+on an unexpected row, not an unintended mutation.
+
+**(ii) RULE 3's second check compares the snapshot to the snapshot, not to the
+pixels.** It catches a roster that moved between push and confirm. It cannot catch
+a roster that moves between the confirm and the lock `lifecycle.RemoveAccount`
+takes; that window is closed inside the lifecycle layer by its own under-lock
+composite re-check, against the roster the action started with.
+
+**(iii) `menuRow` flattens the row label to one colour.** Only the trailing notes
+carry their own. The spec's `MenuItem` is single-coloured by construction (09§3.2),
+so a marker embedded mid-label — the disable frame's `(disabled)`, which sits before
+its action arrow in the spec's order — renders in the row's foreground rather than
+amber. The remove frame's markers are trailing and keep their colours.
+
+**(iv) Only the top frame's cursor is remapped.** A frame below the top keeps
+whatever index it had when it was covered; `popMenu` resets the index to 0 anyway,
+so this is unobservable today and would matter only if `popMenu` were changed to
+restore a per-frame cursor.
+
+**(v) Frozen-derived-state siblings not addressed here.** `autoScreen.settings` is
+loaded once at mount and its `.Model`, `.Strategy` and `.IntervalSeconds` are read
+on every render, so the candidates panel ranks on a mount-time axis
+(`.Threshold`'s freeze is deliberate — 09§4.5). `Model.thresholdPct` is read once at
+construction and thereafter only rewritten by an Auto-screen visit. Both are
+tracked separately from this amendment.

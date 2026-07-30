@@ -446,13 +446,19 @@ func (m *Model) actionDone(msg actionDoneMsg) tea.Cmd {
 		}
 		return tea.Batch(cmds...)
 	}
-	if msg.showOutput {
-		// Deviation #7: no captured stdout to display; surface a plain
-		// completion toast built from the structured result instead of an
-		// output modal over empty text.
-		cmds = append(cmds, m.notify(msg.label+" completed", "", ""))
-	} else if fl := msg.result.firstLine(); fl != "" {
+	if fl := msg.result.firstLine(); fl != "" && !msg.showOutput {
 		cmds = append(cmds, m.notify(fl, "", ""))
+	} else {
+		// Deviation #7 for showOutput: no captured stdout to display, so a plain
+		// completion toast built from the structured result stands in for an output
+		// modal over empty text.
+		//
+		// The same toast now also covers the silent case, which is remove and disable:
+		// neither carries a switch payload, neither asks for output, and runAction
+		// returns an empty message on success, so both used to succeed with no
+		// acknowledgement at all. The list they act on refreshing one poll later is
+		// not an acknowledgement — it is a second thing to interpret (issue #3).
+		cmds = append(cmds, m.notify(msg.label+" completed", "", ""))
 	}
 	return tea.Batch(cmds...)
 }
@@ -518,8 +524,10 @@ func (m *Model) toggleDisabled(number string) tea.Cmd {
 	}, false)
 }
 
-// confirmRemove pushes the remove-confirmation modal (09§2.7).
-func (m *Model) confirmRemove(number, email string) tea.Cmd {
+// confirmRemove pushes the remove-confirmation modal (09§2.7) for an account read
+// from the live snapshot, and re-checks that account's identity before firing.
+func (m *Model) confirmRemove(acc reporting.AccountSnapshot) tea.Cmd {
+	number, email, orgUUID := acc.Number, acc.Email, acc.OrgUUID
 	return m.pushScreen(&confirmModal{
 		title:    "Remove account",
 		yesLabel: "Remove",
@@ -530,11 +538,33 @@ func (m *Model) confirmRemove(number, email string) tea.Cmd {
 			if !confirmed {
 				return nil
 			}
+			// The identity the user agreed to, re-checked against the roster as it is
+			// now. The poll keeps running while the modal is up — Update handles
+			// pollTickMsg whatever screen is top — so the sentence on screen can go
+			// stale before it is answered, and a slot is re-fillable. The test is the
+			// composite (email, organizationUuid), the same one
+			// lifecycle.RemoveAccount applies under its own lock and for the same
+			// reason: an email alone cannot tell two same-email accounts apart
+			// (issue #2).
+			live := m.accountByNumber(number)
+			switch {
+			case live == nil:
+				return m.vanishedToast(number)
+			case live.Email != email || live.OrgUUID != orgUUID:
+				return m.notify(fmt.Sprintf("Account %s is now %s — nothing removed", number, live.Email),
+					"Remove account", "warning")
+			}
 			return m.startAction("Remove account "+number, func() (map[string]any, error) {
 				return nil, m.facade.RemoveAccount(number, true)
 			}, false)
 		},
 	})
+}
+
+// vanishedToast reports a per-account action whose target left the roster between
+// the keypress and the dispatch (issue #2).
+func (m *Model) vanishedToast(number string) tea.Cmd {
+	return m.notify("Account "+number+" is no longer managed", "", "warning")
 }
 
 // addCurrent pushes the add-current-login confirmation (09§2.7).
@@ -658,14 +688,6 @@ func (m *Model) accountByNumber(number string) *reporting.AccountSnapshot {
 		}
 	}
 	return nil
-}
-
-// emailForNumber returns an account's email, or "?" (dashboard remove lookup).
-func (m *Model) emailForNumber(number string) string {
-	if acc := m.accountByNumber(number); acc != nil {
-		return acc.Email
-	}
-	return "?"
 }
 
 // notify appends a toast and schedules its expiry.

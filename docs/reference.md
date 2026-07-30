@@ -1570,6 +1570,34 @@ switch (`enter` confirm while a target is selected), `esc` back; on the
 auto-switch screen, `l` go live / dry-run, `t` threshold (with `←`/`→` to adjust
 and `enter` to finish while adjusting), `esc` back.
 
+The dashboard's menu nests: "Add account…", "Disable / enable account…" and
+"Remove account…" each open a submenu, and `esc` or `←` returns to the
+level above. The two submenus that list accounts show one row per managed
+account, and those rows track the roster as it changes: an account removed,
+added, renamed, or disabled from another `cswap` instance or by the
+auto-switch engine appears, disappears, or relabels itself on the next
+poll, rather than at the next visit to the submenu. A remove row also
+carries the account's state, in the account card's colors — `● active` for
+the account currently signed in, `(disabled)` in the warning color for one
+held out of rotation.
+
+While either of those submenus is open, the accounts monitor above it shows
+only the active account's card, without the per-account rows it shows on
+every other screen. The submenu is already listing the roster; the card
+above states which account the terminal is signed in to now, which is what
+the list itself cannot say about the row the cursor happens to be on.
+
+Selecting an account in either submenu acts on the roster as it is at that
+moment, not as it was when the submenu was drawn. An account that has left
+the roster in between is reported and nothing is done — including on the
+disable path, which has no confirmation step. The removal confirmation
+names an account by email; if the slot changes hands while that
+confirmation is on screen, answering it removes nothing and reports who
+holds the slot instead. Two accounts sharing an email are told apart by
+organization, which is the only thing that distinguishes them. A completed
+removal or disable reports itself; both previously completed without
+acknowledgement.
+
 Disabled accounts appear in the switch and watch lists and remain valid
 explicit targets there, since disabling holds an account out of automatic
 rotation rather than out of the roster. The auto-switch screen's ranked

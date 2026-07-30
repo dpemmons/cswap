@@ -154,13 +154,13 @@ func TestActionFailurePushesOutputModal(t *testing.T) {
 func TestRootMenuStructure(t *testing.T) {
 	d := newDashboardScreen()
 	want := []menuEntry{
-		{"Switch account…", "switch"},
-		{"Watch accounts", "watch"},
-		{"Auto-switch view", "auto"},
-		{"Add account…", "add-menu"},
-		{"Disable / enable account…", "disable-menu"},
-		{"Remove account…", "remove-menu"},
-		{"Quit", "quit"},
+		{label: "Switch account…", actionID: "switch"},
+		{label: "Watch accounts", actionID: "watch"},
+		{label: "Auto-switch view", actionID: "auto"},
+		{label: "Add account…", actionID: "add-menu"},
+		{label: "Disable / enable account…", actionID: "disable-menu"},
+		{label: "Remove account…", actionID: "remove-menu"},
+		{label: "Quit", actionID: "quit"},
 	}
 	if !reflect.DeepEqual(d.rootEntries(), want) {
 		t.Fatalf("root entries = %#v", d.rootEntries())
@@ -187,8 +187,8 @@ func TestRemoveSubmenuLabels(t *testing.T) {
 	if entries[1].label != "2  work (b@x.com)  [Acme]" {
 		t.Fatalf("remove[1] = %q", entries[1].label)
 	}
-	if entries[len(entries)-1] != backEntry {
-		t.Fatalf("remove submenu should end with the back row")
+	if last := entries[len(entries)-1]; !reflect.DeepEqual(last, backEntry) {
+		t.Fatalf("remove submenu should end with the back row, got %#v", last)
 	}
 }
 

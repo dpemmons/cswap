@@ -19,19 +19,37 @@ import (
 	"git.dpemmons.com/dpemmons/cswap/internal/reporting"
 )
 
-// menuEntry is one (label, action_id) menu row (09§3.2 MenuEntries).
+// menuNote is one trailing marker on a menu row, styled independently of the
+// row. The spec's MenuItem carries a single colour for the whole label (09§3.2),
+// which cannot express the account markers the card renders in their own colours
+// — accent-bold "● active", amber "(disabled)" (DESIGN A18) — so the account rows
+// carry them as notes rather than as label text.
+type menuNote struct {
+	text  string
+	style segStyle
+}
+
+// menuEntry is one (label, action_id) menu row (09§3.2 MenuEntries), plus any
+// trailing notes.
 type menuEntry struct {
 	label    string
 	actionID string
+	notes    []menuNote
 }
 
 // menuFrame is one (title, entries) menu stack frame.
+//
+// build, when set, re-derives entries from the live snapshot: the frame lists one
+// row per account, so its rows are roster-derived state and go stale the moment
+// the roster changes. Frames whose rows are fixed (root, add) leave it nil and
+// their entries are computed once.
 type menuFrame struct {
 	title   string
 	entries []menuEntry
+	build   func(*Model) []menuEntry
 }
 
-var backEntry = menuEntry{"← back", "back"}
+var backEntry = menuEntry{label: "← back", actionID: "back"}
 
 // dashboardScreen is the root screen (09§3).
 type dashboardScreen struct {
@@ -48,51 +66,78 @@ func newDashboardScreen() *dashboardScreen {
 // rootEntries are the exact root menu rows, in order (09§3.2, test-asserted).
 func (d *dashboardScreen) rootEntries() []menuEntry {
 	return []menuEntry{
-		{"Switch account…", "switch"},
-		{"Watch accounts", "watch"},
-		{"Auto-switch view", "auto"},
-		{"Add account…", "add-menu"},
-		{"Disable / enable account…", "disable-menu"},
-		{"Remove account…", "remove-menu"},
-		{"Quit", "quit"},
+		{label: "Switch account…", actionID: "switch"},
+		{label: "Watch accounts", actionID: "watch"},
+		{label: "Auto-switch view", actionID: "auto"},
+		{label: "Add account…", actionID: "add-menu"},
+		{label: "Disable / enable account…", actionID: "disable-menu"},
+		{label: "Remove account…", actionID: "remove-menu"},
+		{label: "Quit", actionID: "quit"},
 	}
 }
 
 // addEntries is the Add submenu (09§3.2).
 func (d *dashboardScreen) addEntries() []menuEntry {
 	return []menuEntry{
-		{"From current Claude Code login", "add-login"},
-		{"From a setup-token / API key…", "add-token"},
+		{label: "From current Claude Code login", actionID: "add-login"},
+		{label: "From a setup-token / API key…", actionID: "add-token"},
 		backEntry,
 	}
 }
 
-// removeEntries is one row per account plus back (09§3.2). Alias, when set,
-// precedes the parenthesized email; a plain account shows only the bare email.
+// accountName is the account's display name in a menu row: alias, when set,
+// precedes the parenthesized email; a plain account shows only the bare email
+// (09§3.2 — never "(email)" with no alias).
+func accountName(acc reporting.AccountSnapshot) string {
+	if acc.Alias != "" {
+		return fmt.Sprintf("%s (%s)", acc.Alias, acc.Email)
+	}
+	return acc.Email
+}
+
+// stateNotes are the markers an account row carries after its label, in the
+// account card's order and colours (accountCardText): active first, then
+// disabled. The remove list needs both — removing the account you are signed in
+// to and removing one you deliberately held out of rotation are different acts,
+// and neither is legible from the identity alone (Go-side deviation, DESIGN A21).
+func stateNotes(acc reporting.AccountSnapshot) []menuNote {
+	var notes []menuNote
+	if acc.IsActive {
+		notes = append(notes, menuNote{"   ● active", segStyle{Fg: colAccent, Bold: true}})
+	}
+	if acc.Disabled {
+		notes = append(notes, menuNote{"   (disabled)", segStyle{Fg: colSevWarn}})
+	}
+	return notes
+}
+
+// removeEntries is one row per account plus back (09§3.2), keyed off the live
+// snapshot on every rebuild (menuFrame.build).
 func (d *dashboardScreen) removeEntries(m *Model) []menuEntry {
 	var entries []menuEntry
 	for _, acc := range m.accounts() {
-		name := acc.Email
-		if acc.Alias != "" {
-			name = fmt.Sprintf("%s (%s)", acc.Alias, acc.Email)
-		}
 		entries = append(entries, menuEntry{
-			label:    fmt.Sprintf("%s  %s  [%s]", acc.Number, name, acc.DisplayTag()),
+			label:    fmt.Sprintf("%s  %s  [%s]", acc.Number, accountName(acc), acc.DisplayTag()),
 			actionID: "remove:" + acc.Number,
+			notes:    stateNotes(acc),
 		})
 	}
 	return append(entries, backEntry)
 }
 
 // disableEntries is one row per account, labelled with its state and the action
-// selecting it will take (09§3.2).
+// selecting it will take (09§3.2), keyed off the live snapshot on every rebuild
+// (menuFrame.build).
+//
+// The row states its state and its action in words, in the spec's order (state
+// before action), so it takes no menuNote: notes are trailing, and a trailing
+// marker would separate the arrow from the row it belongs to. What the arrow says
+// and what Model.toggleDisabled does are the same fact only because both read the
+// same snapshot — the rebuild is what makes that true (issue #5).
 func (d *dashboardScreen) disableEntries(m *Model) []menuEntry {
 	var entries []menuEntry
 	for _, acc := range m.accounts() {
-		name := acc.Email
-		if acc.Alias != "" {
-			name = fmt.Sprintf("%s (%s)", acc.Alias, acc.Email)
-		}
+		name := accountName(acc)
 		action := "→ disable"
 		state := ""
 		if acc.Disabled {
@@ -112,6 +157,15 @@ func (d *dashboardScreen) pushMenu(title string, entries []menuEntry) {
 	d.index = 0
 }
 
+// pushLiveMenu pushes a frame whose rows are one per account, so they are rebuilt
+// from every fresh snapshot (onSnapshot). A sibling constructor rather than a
+// variadic option on pushMenu: the two kinds of frame differ in exactly this, and
+// the fixed-entry callers should not have to say so.
+func (d *dashboardScreen) pushLiveMenu(m *Model, title string, build func(*Model) []menuEntry) {
+	d.menuStack = append(d.menuStack, menuFrame{title: title, entries: build(m), build: build})
+	d.index = 0
+}
+
 func (d *dashboardScreen) popMenu() {
 	if len(d.menuStack) > 1 {
 		d.menuStack = d.menuStack[:len(d.menuStack)-1]
@@ -120,7 +174,78 @@ func (d *dashboardScreen) popMenu() {
 }
 
 func (d *dashboardScreen) currentEntries() []menuEntry {
-	return d.menuStack[len(d.menuStack)-1].entries
+	return d.topFrame().entries
+}
+
+func (d *dashboardScreen) topFrame() *menuFrame {
+	return &d.menuStack[len(d.menuStack)-1]
+}
+
+// onSnapshot re-derives every account-listing frame from the fresh snapshot.
+// dashboardScreen is a snapshotObserver for this alone: its menu rows are the only
+// roster-derived state on the screen that is not rebuilt from m.snapshot on every
+// frame — the accounts monitor above them is — and Model.applySnapshot fans out to
+// observers only, so without this nothing ever tells the dashboard the roster
+// changed (issue #1).
+//
+// Every frame with a builder is rebuilt, not just the visible one: the stack is
+// only ever two deep today, but a stale frame under the top one is the same defect
+// deferred, and the cost is one call per frame per poll.
+//
+// Only the top frame carries the cursor, so only it is remapped. There is no
+// "rebuild changed nothing, skip the remap" guard, because there is nothing to
+// guard: remapMenuIndex finds the selected action where it already was whenever the
+// actions are unchanged, so the common case — a routine usage refresh, or the
+// relabelling a disable toggle causes — is invariant by construction rather than by
+// a conditional. accountListScreen.onSnapshotBase needs that conditional because it
+// rebuilds a whole ListView; this rebuilds a slice and re-derives one integer.
+func (d *dashboardScreen) onSnapshot(m *Model) tea.Cmd {
+	top := len(d.menuStack) - 1
+	for i := range d.menuStack {
+		frame := &d.menuStack[i]
+		if frame.build == nil {
+			continue
+		}
+		previous := frame.entries
+		frame.entries = frame.build(m)
+		if i == top {
+			d.index = remapMenuIndex(previous, d.index, frame.entries)
+		}
+	}
+	return nil
+}
+
+// remapMenuIndex re-places the cursor after a rebuild. It follows the selected row's
+// action — which is where it already was if the rows did not change — and when that
+// action is gone it parks on the back row rather than on whichever account slid into
+// its position: these rows are the dashboard's destructive action surface, and a
+// cursor left sitting where a removed account used to be invites the next Enter to
+// act on its neighbour.
+//
+// The identity it follows is the SLOT — actionID is "remove:<number>" — not the
+// account, and a slot emptied and refilled carries the cursor to its new occupant.
+// Two things make that safe rather than merely likely-safe: the row's label is
+// rebuilt from the same snapshot, so the new occupant is named where the cursor
+// sits, and dispatch re-validates the target against the live snapshot before
+// acting either way (issue #2).
+func remapMenuIndex(previous []menuEntry, index int, next []menuEntry) int {
+	if len(next) == 0 {
+		return 0
+	}
+	if index >= 0 && index < len(previous) {
+		want := previous[index].actionID
+		for i, e := range next {
+			if e.actionID == want {
+				return i
+			}
+		}
+	}
+	for i, e := range next {
+		if e.actionID == backEntry.actionID {
+			return i
+		}
+	}
+	return clampInt(index, 0, len(next)-1)
 }
 
 func (d *dashboardScreen) update(m *Model, msg tea.Msg) tea.Cmd {
@@ -171,16 +296,29 @@ func (d *dashboardScreen) dispatch(m *Model, actionID string) tea.Cmd {
 		d.pushMenu("add account", d.addEntries())
 		return nil
 	case actionID == "remove-menu":
-		d.pushMenu("remove account", d.removeEntries(m))
+		d.pushLiveMenu(m, "remove account", d.removeEntries)
 		return nil
 	case strings.HasPrefix(actionID, "remove:"):
 		number := strings.TrimPrefix(actionID, "remove:")
-		return m.confirmRemove(number, m.emailForNumber(number))
+		acc := m.accountByNumber(number)
+		if acc == nil {
+			return m.vanishedToast(number)
+		}
+		return m.confirmRemove(*acc)
 	case actionID == "disable-menu":
-		d.pushMenu("disable / enable", d.disableEntries(m))
+		d.pushLiveMenu(m, "disable / enable", d.disableEntries)
 		return nil
 	case strings.HasPrefix(actionID, "disable:"):
 		number := strings.TrimPrefix(actionID, "disable:")
+		// Re-validated here, not left to toggleDisabled's nil return: that return
+		// is silent, and the popMenu below fires either way, so an unknown number
+		// used to land the user back at the root menu having been told nothing at
+		// all (issue #2). This path has no confirmation modal by design (09§3.3),
+		// which makes it the one that most needs the check.
+		if m.accountByNumber(number) == nil {
+			d.popMenu()
+			return m.vanishedToast(number)
+		}
 		cmd := m.toggleDisabled(number)
 		d.popMenu()
 		return cmd
@@ -229,15 +367,20 @@ func (d *dashboardScreen) view(m *Model) string {
 	for _, f := range d.menuStack {
 		crumb = append(crumb, f.title)
 	}
-	crumbLine := mutedLine(strings.Join(crumb, " › "))
+	crumbLine := mutedClipped(strings.Join(crumb, " › "), inner)
 
 	entries := d.currentEntries()
 	rows := make([]string, len(entries))
 	for i, e := range entries {
-		rows[i] = menuRow(e, i == d.index)
+		rows[i] = menuRow(e, i == d.index, inner)
 	}
 
-	panelLines := strings.Split(accountsPanelText(m.snapshot, inner, true, m.thresholdPct, now).render(), "\n")
+	// An account-listing frame enumerates the roster itself, so the monitor above it
+	// drops its per-account rows and shows the active account's card alone: the
+	// screen states where you are once and what you can pick once, instead of the
+	// same roster twice in two different vocabularies (issue #1).
+	showMinis := d.topFrame().build == nil
+	panelLines := strings.Split(monitorPanelText(m.snapshot, inner, showMinis, m.thresholdPct, now, true).render(), "\n")
 
 	avail := m.contentHeight()
 	if avail < 0 {
@@ -278,7 +421,7 @@ func (d *dashboardScreen) view(m *Model) string {
 
 	var out []string
 	if panelBudget > 0 {
-		out = append(out, accountsMonitorCapped(m.snapshot, inner, m.thresholdPct, now, panelBudget)...)
+		out = append(out, cappedPanel(m.snapshot, inner, showMinis, m.thresholdPct, now, panelBudget)...)
 		out = append(out, "")
 	}
 	rowsBudget := menuBudget - 1
@@ -294,17 +437,63 @@ func (d *dashboardScreen) view(m *Model) string {
 }
 
 // menuRow renders one menu row with the accent left-border cursor affordance
-// (09§8.2). The back row renders muted (09§3.2).
-func menuRow(e menuEntry, selected bool) string {
+// (09§8.2). The back row renders muted (09§3.2); trailing notes keep their own
+// colours, which is why the row is assembled as segments rather than one styled
+// label.
+//
+// Held to width: the account rows are built from an email, an alias and an org
+// name, so their length is roster data, not layout (a realistic disable row
+// measures 51 columns). Every other surface in the package fits its lines before
+// returning them; this one did not, and the never-wrap sweep does not reach it
+// (issue #4 covers the rest of that gap).
+func menuRow(e menuEntry, selected bool, width int) string {
 	color := colForeground
-	if e.actionID == "back" {
+	if e.actionID == backEntry.actionID {
 		color = colMuted
 	}
-	label := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(e.label)
+	var t richText
 	if selected {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color(colAccent)).Render("▌ ") + label
+		t.add("▌ ", segStyle{Fg: colAccent})
+	} else {
+		t.addPlain("  ")
 	}
-	return "  " + label
+	t.addFg(e.label, color)
+	for _, n := range e.notes {
+		t.add(n.text, n.style)
+	}
+	return clipRichLines(t, width).render()
+}
+
+// mutedClipped is a muted line held to width, for the menu region's head lines —
+// built from content (a joined breadcrumb, a note) rather than laid out.
+func mutedClipped(s string, width int) string {
+	var t richText
+	t.addFg(s, colMuted)
+	return clipRichLines(t, width).render()
+}
+
+// cappedPanel renders the accounts monitor into at most budget lines, in the layout
+// the dashboard is showing.
+//
+// With minis on this is accountsMonitorCapped, whose whole job is eliding whole
+// accounts and stating how many it elided. With minis off there is nothing to elide
+// — the panel is the active account's card alone — so the budget takes its leading
+// lines, identity first. Routing the collapsed panel through accountsMonitorCapped
+// would be wrong twice: it hardcodes minis on, and at a one-line budget it spends
+// that line on the "N more accounts" indicator, leaving the single row on screen
+// naming no account at all.
+func cappedPanel(snap *reporting.AccountsSnapshot, width int, showMinis bool, threshold *float64, now float64, budget int) []string {
+	if budget <= 0 {
+		return nil
+	}
+	if showMinis {
+		return accountsMonitorCapped(snap, width, threshold, now, budget)
+	}
+	lines := strings.Split(monitorPanelText(snap, width, false, threshold, now, true).render(), "\n")
+	if len(lines) > budget {
+		lines = lines[:budget]
+	}
+	return lines
 }
 
 // -- shared account-list machinery (09§3.4) ----------------------------------
